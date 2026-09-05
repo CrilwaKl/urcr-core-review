@@ -1,0 +1,208 @@
+diff --git a/verl/trainer/ppo/evisd_teacher.py b/verl/trainer/ppo/evisd_teacher.py
+index 82d0bfc..11877e7 100644
+--- a/verl/trainer/ppo/evisd_teacher.py
++++ b/verl/trainer/ppo/evisd_teacher.py
+@@ -235,7 +235,8 @@ def _build_1g1d_evidence(
+         body = _truncate_text(body, max_chars_per_doc) if body else ""
+         if body:
+             item = _truncate_text(f"- {gold_title}: {body}", max_total_chars - total_chars)
+-            evidence.append(item); total_chars += len(item)
++            evidence.append(item)
++            total_chars += len(item)
+ 
+     # Add one randomly sampled non-gold document.
+     gold_set = set(sf_titles)
+@@ -247,7 +248,8 @@ def _build_1g1d_evidence(
+             remaining = max_total_chars - total_chars
+             if remaining > 0:
+                 item = _truncate_text(f"- {ctx_titles[di]}: {body}", remaining)
+-                evidence.append(item); total_chars += len(item)
++                evidence.append(item)
++                total_chars += len(item)
+     return "\n".join(evidence) if evidence else "None provided"
+ 
+ 
+@@ -310,6 +312,29 @@ def _trim_span_whitespace(text: str, start: int, end: int) -> tuple[int, int]:
+     return start, end
+ 
+ 
++def token_char_offsets_from_ids(tokenizer, token_ids: list[int]) -> tuple[str, list[tuple[int, int]]]:
++    """Decode generated IDs while retaining their original token boundaries."""
++    decode_kwargs = {
++        "skip_special_tokens": False,
++        "clean_up_tokenization_spaces": False,
++    }
++    response_text = tokenizer.decode(token_ids, **decode_kwargs)
++    pieces = tokenizer.batch_decode([[token_id] for token_id in token_ids], **decode_kwargs)
++    if "".join(pieces) == response_text:
++        boundaries = [0]
++        for piece in pieces:
++            boundaries.append(boundaries[-1] + len(piece))
++    else:
++        boundaries = [0]
++        for end in range(1, len(token_ids) + 1):
++            boundaries.append(len(tokenizer.decode(token_ids[:end], **decode_kwargs)))
++        if boundaries[-1] != len(response_text) or any(
++            right < left for left, right in zip(boundaries, boundaries[1:])
++        ):
++            raise ValueError("Tokenizer decode boundaries are not monotonic")
++    return response_text, list(zip(boundaries[:-1], boundaries[1:]))
++
++
+ def _find_action_spans(response_text: str, include_search: bool = True, include_answer: bool = True) -> list[tuple[int, int]]:
+     """Locate content spans inside generated search and answer actions."""
+     spans = []
+@@ -343,21 +368,48 @@ def _span_mask_from_token_offsets(
+     return mask
+ 
+ 
+-def _span_mask_by_retokenize(
++def evisd_action_mask_from_token_ids(
+     tokenizer,
+-    response_text: str,
+-    spans: list[tuple[int, int]],
+-    max_len: int,
+-) -> torch.Tensor:
+-    mask = torch.zeros(max_len, dtype=torch.float32)
+-    for span_start, span_end in spans:
+-        prefix_len = len(tokenizer.encode(response_text[:span_start], add_special_tokens=False))
+-        span_len = len(tokenizer.encode(response_text[span_start:span_end], add_special_tokens=False))
+-        if prefix_len >= max_len:
+-            continue
+-        end = min(prefix_len + span_len, max_len)
+-        mask[prefix_len:end] = 1.0
+-    return mask
++    response_ids: list[int],
++    *,
++    include_search: bool = True,
++    include_answer: bool = True,
++) -> list[int]:
++    """Return the official EviSD mask over every complete action-content span."""
++    response_text, offsets = token_char_offsets_from_ids(tokenizer, response_ids)
++    spans = _find_action_spans(
++        response_text,
++        include_search=include_search,
++        include_answer=include_answer,
++    )
++    return _span_mask_from_token_offsets(offsets, spans, len(response_ids)).int().tolist()
++
++
++def evisd_typed_action_masks_from_token_ids(
++    tokenizer,
++    response_ids: list[int],
++) -> tuple[list[int], list[int], list[int]]:
++    """Partition the official EviSD mask by the teacher's action context.
++
++    Search projection and the EviSD teacher both give the first complete search
++    action precedence over answer.  Malformed generations can contain both or
++    nest their spans, so independently parsed tag masks are not necessarily
++    disjoint.  Assigning the complete official action mask at the row level
++    preserves official EviSD while ensuring that search-conditioned tokens are
++    Q0 shadow only and answer correction is retained only for answer-conditioned
++    teacher rows.
++    """
++    response_text, offsets = token_char_offsets_from_ids(tokenizer, response_ids)
++    official = _span_mask_from_token_offsets(
++        offsets,
++        _find_action_spans(response_text, include_search=True, include_answer=True),
++        len(response_ids),
++    ).int()
++    zeros = torch.zeros_like(official)
++    action_type = _extract_action_type(response_text)
++    search = official if action_type == "search" else zeros
++    answer = official if action_type == "answer" else zeros
++    return search.tolist(), answer.tolist(), official.tolist()
+ 
+ 
+ def build_evisd_action_mask(
+@@ -373,35 +425,67 @@ def build_evisd_action_mask(
+     masks = []
+ 
+     for i in range(bs):
+-        valid_len = int(response_mask[i].sum().item())
+-        response_ids = responses[i, :valid_len].detach().cpu().tolist()
+-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+-        spans = _find_action_spans(
+-            response_text,
+-            include_search=include_search,
+-            include_answer=include_answer,
++        valid_positions = torch.nonzero(response_mask[i].bool(), as_tuple=False).flatten()
++        response_ids = responses[i, valid_positions].detach().cpu().tolist()
++        valid_mask = torch.tensor(
++            evisd_action_mask_from_token_ids(
++                tokenizer,
++                response_ids,
++                include_search=include_search,
++                include_answer=include_answer,
++            ),
++            dtype=torch.float32,
+         )
+-        if not spans:
+-            masks.append(torch.zeros(response_length, dtype=torch.float32))
+-            continue
+-
+-        try:
+-            encoded = tokenizer(
+-                response_text,
+-                add_special_tokens=False,
+-                return_offsets_mapping=True,
+-            )
+-            offsets = encoded["offset_mapping"]
+-            mask = _span_mask_from_token_offsets(offsets, spans, response_length)
+-        except Exception:
+-            mask = _span_mask_by_retokenize(tokenizer, response_text, spans, response_length)
+-
+-        mask = mask * response_mask[i].detach().cpu().float()
++        mask = torch.zeros(response_length, dtype=torch.float32)
++        if valid_positions.numel():
++            mask[valid_positions.detach().cpu()] = valid_mask
+         masks.append(mask)
+ 
+     return torch.stack(masks).to(device=response_mask.device, dtype=response_mask.dtype)
+ 
+ 
++def build_evisd_typed_action_masks(
++    batch: DataProto,
++    tokenizer,
++    response_mask: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return disjoint search, answer, and unchanged official action masks."""
++    responses = batch.batch["responses"]
++    _, response_length = responses.shape
++    search_masks = []
++    answer_masks = []
++    official_masks = []
++    for index in range(len(batch)):
++        valid_positions = torch.nonzero(
++            response_mask[index].bool(),
++            as_tuple=False,
++        ).flatten()
++        response_ids = responses[index, valid_positions].detach().cpu().tolist()
++        typed_masks = evisd_typed_action_masks_from_token_ids(tokenizer, response_ids)
++        padded = []
++        for values in typed_masks:
++            mask = torch.zeros(response_length, dtype=torch.float32)
++            if valid_positions.numel():
++                mask[valid_positions.detach().cpu()] = torch.tensor(
++                    values,
++                    dtype=torch.float32,
++                )
++            padded.append(mask)
++        search_masks.append(padded[0])
++        answer_masks.append(padded[1])
++        official_masks.append(padded[2])
++
++    target = {
++        "device": response_mask.device,
++        "dtype": response_mask.dtype,
++    }
++    return (
++        torch.stack(search_masks).to(**target),
++        torch.stack(answer_masks).to(**target),
++        torch.stack(official_masks).to(**target),
++    )
++
++
+ _EVISD_PRINTED_KEYS: set = set()
+ 
+ 

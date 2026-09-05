@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+outputs/
+logs/
+data/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.parquet
+*.arrow
+tmp*/

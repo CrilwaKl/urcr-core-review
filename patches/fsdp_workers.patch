@@ -1,0 +1,173 @@
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 5b376a6..198d013 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -61,7 +61,6 @@ from verl.utils.device import get_device_name, get_torch_device, is_cuda_availab
+ 
+ 
+ from peft import LoraConfig, TaskType, get_peft_model
+-from codetiming import Timer
+ 
+ import torch.distributed as dist
+ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+@@ -609,28 +608,51 @@ class ActorRolloutRefWorker(Worker):
+         if self._is_offload_optimizer:
+             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
+ 
+-        with self.ulysses_sharding_manager:
+-            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+-            # perform training
+-            with Timer(name="update_policy", logger=None) as timer:
+-                metrics = self.actor.update_policy(data=data)
+-            delta_time = timer.last
+-            global_num_tokens = data.meta_info["global_token_num"]
+-            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+-            metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+-            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+-            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+-            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+-
+-            lr = self.actor_lr_scheduler.get_last_lr()[0]
+-            metrics["actor/lr"] = lr
+-            self.actor_lr_scheduler.step()
++        update_audit = None
++        update_audit_spec = data.meta_info.get("urcr_update_audit")
++        if update_audit_spec:
++            from verl.trainer.ppo.urcr_update_audit import DistributedUpdateAudit
+ 
+-            # TODO: here, we should return all metrics
+-            output = DataProto(meta_info={"metrics": metrics})
+-
+-            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+-            output = output.to("cpu")
++            update_audit = DistributedUpdateAudit(
++                self.actor_module_fsdp,
++                reference_dir=update_audit_spec["reference_dir"],
++                rank=self.rank,
++                world_size=self.world_size,
++                save_reference=bool(update_audit_spec.get("save_reference", False)),
++                compare_reference=bool(update_audit_spec.get("compare_reference", False)),
++                summary_only=bool(update_audit_spec.get("summary_only", False)),
++            )
++            self.actor._urcr_update_audit = update_audit
++
++        try:
++            with self.ulysses_sharding_manager:
++                data = self.ulysses_sharding_manager.preprocess_data(data=data)
++                # perform training
++                with Timer(name="update_policy", logger=None) as timer:
++                    metrics = self.actor.update_policy(data=data)
++                delta_time = timer.last
++                global_num_tokens = data.meta_info["global_token_num"]
++                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
++                metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
++                metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
++                metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
++                metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
++
++                lr = self.actor_lr_scheduler.get_last_lr()[0]
++                metrics["actor/lr"] = lr
++                self.actor_lr_scheduler.step()
++
++                if update_audit is not None:
++                    metrics.update(update_audit.finalize(self.actor_module_fsdp))
++
++                # TODO: here, we should return all metrics
++                output = DataProto(meta_info={"metrics": metrics})
++
++                output = self.ulysses_sharding_manager.postprocess_data(data=output)
++                output = output.to("cpu")
++        finally:
++            if hasattr(self.actor, "_urcr_update_audit"):
++                del self.actor._urcr_update_audit
+ 
+         if self._is_offload_param:
+             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+@@ -712,6 +734,87 @@ class ActorRolloutRefWorker(Worker):
+ 
+         return output
+ 
++    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
++    def compute_urcr_responsibility(self, data: DataProto):
++        """Score Plan 05 true query-to-think masks on the current old actor."""
++        assert self._is_actor
++        if self.ulysses_sequence_parallel_size != 1:
++            raise ValueError("Plan 05 responsibility scorer requires Ulysses sequence parallel size 1")
++        if self._is_offload_param:
++            load_fsdp_model_to_gpu(self.actor_module_fsdp)
++
++        from verl.trainer.ppo.urcr_responsibility import (
++            model_attention_backends_restored,
++            restore_model_attention_backends,
++            score_query_to_think_batch,
++            set_model_attention_backend,
++        )
++
++        data = data.to(get_torch_device().current_device())
++        model = self.actor_module_fsdp
++        was_training = model.training
++        backend_states = []
++        backend_restored = False
++        try:
++            if any(parameter.grad is not None for parameter in model.parameters()):
++                raise RuntimeError("Actor gradients must be empty before responsibility scoring")
++            backend_states = set_model_attention_backend(
++                model,
++                "sdpa",
++                extra_configs=(self.actor_model_config,),
++            )
++            model.eval()
++            tensors = score_query_to_think_batch(
++                model,
++                input_ids=data.batch["input_ids"],
++                attention_mask=data.batch["attention_mask"],
++                position_ids=data.batch["position_ids"],
++                responses=data.batch["responses"],
++                response_mask=data.batch["response_mask"],
++                think_mask=data.batch["urcr_think_mask"],
++                query_mask=data.batch["urcr_query_mask"],
++                chunk_mask=(
++                    data.batch["urcr_chunk_mask"]
++                    if "urcr_chunk_mask" in data.batch
++                    else None
++                ),
++                chunk_count=(
++                    data.batch["urcr_chunk_count"]
++                    if "urcr_chunk_count" in data.batch
++                    else None
++                ),
++                temperature=float(data.meta_info["temperature"]),
++                micro_batch_size=int(data.meta_info["urcr_micro_batch_size"]),
++            )
++            if any(value.requires_grad for value in tensors.values()):
++                raise RuntimeError("Responsibility scorer returned a tensor attached to autograd")
++            if any(parameter.grad is not None for parameter in model.parameters()):
++                raise RuntimeError("Responsibility scoring populated actor gradients")
++            restore_model_attention_backends(backend_states)
++            backend_restored = model_attention_backends_restored(backend_states)
++            model.train(was_training)
++            row_count = len(data)
++            tensors["urcr_scorer_no_grad"] = torch.ones(
++                row_count, dtype=torch.bool, device=get_torch_device().current_device()
++            )
++            tensors["urcr_backend_restored"] = torch.full(
++                (row_count,),
++                backend_restored,
++                dtype=torch.bool,
++                device=get_torch_device().current_device(),
++            )
++            output = DataProto.from_dict(tensors=tensors).to("cpu")
++        finally:
++            restore_model_attention_backends(backend_states)
++            model.train(was_training)
++            if self.world_size > 1 and fsdp_version(self.actor_module_fsdp) == 1:
++                for handle in self.actor_module_fsdp._all_handles:
++                    handle.reshard(True)
++            if self._is_offload_param:
++                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
++                log_gpu_memory_usage("After offload actor model during URCR responsibility", logger=logger)
++        return output
++
+     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+     def compute_ref_log_prob(self, data: DataProto):
+         if self._is_lora:

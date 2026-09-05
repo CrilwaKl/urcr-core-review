@@ -1,0 +1,399 @@
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index e3b4993..c075a43 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -18,7 +18,6 @@ Single Process Actor
+ """
+ 
+ import itertools
+-import time
+ import logging
+ import os
+ from typing import Tuple
+@@ -234,6 +233,10 @@ class DataParallelPPOActor(BasePPOActor):
+     def _optimizer_step(self):
+         assert self.config.grad_clip is not None
+ 
++        update_audit = getattr(self, "_urcr_update_audit", None)
++        if update_audit is not None:
++            update_audit.capture_gradient_step()
++
+         if isinstance(self.actor_module, FSDP):
+             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+         elif isinstance(self.actor_module, FSDPModule):
+@@ -322,6 +325,57 @@ class DataParallelPPOActor(BasePPOActor):
+         multi_turn = data.meta_info.get("multi_turn", False)
+ 
+         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
++        urcr_v2_keys = (
++            "urcr_v2_query_mask",
++            "urcr_v2_think_mask",
++            "urcr_v2_query_eligible",
++            "urcr_v2_think_eligible",
++            "urcr_v2_query_reward",
++            "urcr_v2_think_reward",
++            "urcr_v2_selected_think_length",
++            "urcr_v2_rho",
++        )
++        present_urcr_v2_keys = [key for key in urcr_v2_keys if key in data.batch]
++        if present_urcr_v2_keys and len(present_urcr_v2_keys) != len(urcr_v2_keys):
++            raise ValueError("URCR v2 local-objective tensors are incomplete")
++        use_urcr_v2_local = len(present_urcr_v2_keys) == len(urcr_v2_keys)
++        urcr_v2_spec = data.meta_info.get("urcr_v2_local_objective")
++        if use_urcr_v2_local != bool(urcr_v2_spec):
++            raise ValueError("URCR v2 tensors and local-objective metadata disagree")
++        if use_urcr_v2_local:
++            if self.config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
++                raise ValueError("URCR v2 local objective requires vanilla PPO")
++            select_keys.extend(urcr_v2_keys)
++        urcr_reduction_keys = (
++            "urcr_query_span_mask",
++            "urcr_think_span_mask",
++            "urcr_query_residual",
++            "urcr_think_residual",
++        )
++        audit_urcr_reduction = all(key in data.batch for key in urcr_reduction_keys)
++        if audit_urcr_reduction:
++            if self.config.policy_loss.get("loss_mode", "vanilla") != "vanilla":
++                raise ValueError("Plan 05 PPO reduction audit requires vanilla policy loss")
++            select_keys.extend(urcr_reduction_keys)
++        same_forward_profiles = (
++            "official_evisd",
++            "answer_only",
++            "g2_query_only",
++            "g2_full",
++            "g2_shuffled",
++            "g2_real",
++        )
++        same_forward_keys = tuple(
++            f"urcr_profile_adv_{profile}" for profile in same_forward_profiles
++        )
++        present_same_forward_keys = [key for key in same_forward_keys if key in data.batch]
++        if present_same_forward_keys and len(present_same_forward_keys) != len(same_forward_keys):
++            raise ValueError("Plan05-MIX same-forward profile tensors are incomplete")
++        audit_same_forward = len(present_same_forward_keys) == len(same_forward_keys)
++        if audit_same_forward:
++            if not audit_urcr_reduction:
++                raise ValueError("Plan05-MIX same-forward audit requires URCR role masks")
++            select_keys.extend(same_forward_keys)
+         if multi_turn:
+             select_keys.append("loss_mask")
+         if self.config.use_kl_loss:
+@@ -341,10 +395,37 @@ class DataParallelPPOActor(BasePPOActor):
+             dataloader = batch.split(self.config.ppo_mini_batch_size)
+ 
+         metrics = {}
++        urcr_reduction_totals = {}
++        urcr_same_forward_totals = {}
+         for epoch in range(self.config.ppo_epochs):
+             for batch_idx, data in enumerate(dataloader):
+                 # split batch into micro_batches
+                 mini_batch = data
++                if use_urcr_v2_local:
++                    global_local_counts = torch.stack(
++                        (
++                            mini_batch["urcr_v2_query_eligible"].float().sum(),
++                            mini_batch["urcr_v2_think_eligible"].float().sum(),
++                        )
++                    )
++                    if torch.distributed.is_available() and torch.distributed.is_initialized():
++                        torch.distributed.all_reduce(
++                            global_local_counts,
++                            op=torch.distributed.ReduceOp.SUM,
++                        )
++                        urcr_v2_world_size = torch.distributed.get_world_size()
++                    else:
++                        urcr_v2_world_size = 1
++                    local_numerator_totals = torch.zeros(
++                        2,
++                        dtype=torch.float32,
++                        device=global_local_counts.device,
++                    )
++                    local_dlogp_totals = torch.zeros(
++                        10,
++                        dtype=torch.float64,
++                        device=global_local_counts.device,
++                    )
+                 if has_multi_modal_inputs:
+                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+@@ -388,6 +469,31 @@ class DataParallelPPOActor(BasePPOActor):
+                     if entropy_coeff != 0:
+                         calculate_entropy = True
+                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
++
++                    if audit_same_forward:
++                        from verl.trainer.ppo.urcr_metrics import urcr_same_forward_terms
++
++                        same_forward_terms = urcr_same_forward_terms(
++                            old_log_prob=old_log_prob,
++                            log_prob=log_prob,
++                            profile_advantages={
++                                profile: data[f"urcr_profile_adv_{profile}"]
++                                for profile in same_forward_profiles
++                            },
++                            response_mask=response_mask,
++                            query_span_mask=data["urcr_query_span_mask"],
++                            think_span_mask=data["urcr_think_span_mask"],
++                            clip_ratio=clip_ratio,
++                            clip_ratio_low=clip_ratio_low,
++                            clip_ratio_high=clip_ratio_high,
++                            clip_ratio_c=clip_ratio_c,
++                            loss_agg_mode=loss_agg_mode,
++                            gradient_accumulation=self.gradient_accumulation,
++                        )
++                        for key, value in same_forward_terms.items():
++                            urcr_same_forward_totals[key] = (
++                                urcr_same_forward_totals.get(key, 0.0) + value
++                            )
+                     
+                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                     if loss_mode == "vanilla":
+@@ -409,6 +515,28 @@ class DataParallelPPOActor(BasePPOActor):
+                         loss_agg_mode=loss_agg_mode,
+                     )
+ 
++                    if audit_urcr_reduction:
++                        from verl.trainer.ppo.urcr_metrics import urcr_ppo_reduction_terms
++
++                        reduction_terms = urcr_ppo_reduction_terms(
++                            old_log_prob=old_log_prob,
++                            log_prob=log_prob,
++                            advantages=advantages,
++                            response_mask=response_mask,
++                            query_span_mask=data["urcr_query_span_mask"],
++                            think_span_mask=data["urcr_think_span_mask"],
++                            query_residual=data["urcr_query_residual"],
++                            think_residual=data["urcr_think_residual"],
++                            clip_ratio=clip_ratio,
++                            clip_ratio_low=clip_ratio_low,
++                            clip_ratio_high=clip_ratio_high,
++                            clip_ratio_c=clip_ratio_c,
++                            loss_agg_mode=loss_agg_mode,
++                            gradient_accumulation=self.gradient_accumulation,
++                        )
++                        for key, value in reduction_terms.items():
++                            urcr_reduction_totals[key] = urcr_reduction_totals.get(key, 0.0) + value
++
+                     pg_loss_coef = self.config.get("pg_loss_coef", 1.0)
+                     if entropy_coeff != 0:
+                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+@@ -418,6 +546,85 @@ class DataParallelPPOActor(BasePPOActor):
+                     else:
+                         policy_loss = pg_loss * pg_loss_coef
+ 
++                    urcr_v2_local_loss = None
++                    if use_urcr_v2_local:
++                        from verl.trainer.ppo.urcr_local_objective import (
++                            compute_urcr_local_policy_losses,
++                        )
++
++                        local_terms = compute_urcr_local_policy_losses(
++                            old_log_prob=old_log_prob,
++                            log_prob=log_prob,
++                            query_mask=data["urcr_v2_query_mask"],
++                            think_mask=data["urcr_v2_think_mask"],
++                            query_eligible=data["urcr_v2_query_eligible"],
++                            think_eligible=data["urcr_v2_think_eligible"],
++                            query_reward=data["urcr_v2_query_reward"],
++                            think_reward=data["urcr_v2_think_reward"],
++                            selected_think_length=data[
++                                "urcr_v2_selected_think_length"
++                            ],
++                            think_length_ref=float(urcr_v2_spec["think_length_ref"]),
++                            global_query_eligible_count=global_local_counts[0],
++                            global_think_eligible_count=global_local_counts[1],
++                            clip_ratio_low=clip_ratio_low,
++                            clip_ratio_high=clip_ratio_high,
++                        )
++                        alpha = float(urcr_v2_spec["alpha"])
++                        urcr_v2_local_loss = alpha * urcr_v2_world_size * (
++                            float(urcr_v2_spec["query_loss_weight"])
++                            * local_terms.query_loss
++                            + float(urcr_v2_spec["think_loss_weight"])
++                            * local_terms.think_loss
++                        )
++                        local_numerator_totals += torch.stack(
++                            (
++                                local_terms.query_numerator.detach().float(),
++                                local_terms.think_numerator.detach().float(),
++                            )
++                        )
++                        # Cheap same-forward diagnostics: gradients stop at the
++                        # already-computed log-prob tensor and never re-run the actor.
++                        global_dlogp = torch.autograd.grad(
++                            pg_loss
++                            * pg_loss_coef
++                            / self.gradient_accumulation
++                            / urcr_v2_world_size,
++                            log_prob,
++                            retain_graph=True,
++                        )[0]
++                        query_dlogp = torch.autograd.grad(
++                            alpha
++                            * float(urcr_v2_spec["query_loss_weight"])
++                            * local_terms.query_loss,
++                            log_prob,
++                            retain_graph=True,
++                        )[0]
++                        think_dlogp = torch.autograd.grad(
++                            alpha
++                            * float(urcr_v2_spec["think_loss_weight"])
++                            * local_terms.think_loss,
++                            log_prob,
++                            retain_graph=True,
++                        )[0]
++                        combined_dlogp = query_dlogp + think_dlogp
++                        net_dlogp = global_dlogp + combined_dlogp
++                        query_role = data["urcr_v2_query_mask"].bool()
++                        local_dlogp_totals += torch.stack(
++                            (
++                                global_dlogp.double().square().sum(),
++                                query_dlogp.double().square().sum(),
++                                think_dlogp.double().square().sum(),
++                                combined_dlogp.double().square().sum(),
++                                net_dlogp.double().square().sum(),
++                                (global_dlogp.double() * combined_dlogp.double()).sum(),
++                                ((global_dlogp < 0) & query_role).double().sum(),
++                                ((query_dlogp < 0) & query_role).double().sum(),
++                                ((net_dlogp < 0) & query_role).double().sum(),
++                                query_role.double().sum(),
++                            )
++                        ).detach()
++
+                     if self.config.use_kl_loss:
+                         ref_log_prob = data["ref_log_prob"]
+                         # compute kl loss
+@@ -464,6 +671,10 @@ class DataParallelPPOActor(BasePPOActor):
+                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                     else:
+                         loss = policy_loss / self.gradient_accumulation
++                    # Local numerators are already divided by the optimizer-update
++                    # global action count. Do not divide them by gradient accumulation.
++                    if urcr_v2_local_loss is not None:
++                        loss = loss + urcr_v2_local_loss
+                     loss.backward()
+ 
+                     data = {
+@@ -477,5 +688,121 @@ class DataParallelPPOActor(BasePPOActor):
+                 grad_norm = self._optimizer_step()
+                 data = {"actor/grad_norm": grad_norm.detach().item()}
+                 append_to_dict(metrics, data)
++                if use_urcr_v2_local:
++                    global_numerators = local_numerator_totals.clone()
++                    global_dlogp_totals = local_dlogp_totals.clone()
++                    if torch.distributed.is_available() and torch.distributed.is_initialized():
++                        torch.distributed.all_reduce(
++                            global_numerators,
++                            op=torch.distributed.ReduceOp.SUM,
++                        )
++                        torch.distributed.all_reduce(
++                            global_dlogp_totals,
++                            op=torch.distributed.ReduceOp.SUM,
++                        )
++                    query_denominator = max(float(global_local_counts[0]), 1.0)
++                    think_denominator = max(float(global_local_counts[1]), 1.0)
++                    query_local_value = -float(global_numerators[0]) / query_denominator
++                    think_local_value = -float(global_numerators[1]) / think_denominator
++                    effective_local_value = float(urcr_v2_spec["alpha"]) * (
++                        float(urcr_v2_spec["query_loss_weight"])
++                        * query_local_value
++                        + float(urcr_v2_spec["think_loss_weight"])
++                        * think_local_value
++                    )
++                    append_to_dict(
++                        metrics,
++                        {
++                            "urcr_v2/query_local_loss": query_local_value,
++                            "urcr_v2/think_local_loss": think_local_value,
++                            "urcr_v2/effective_local_loss": effective_local_value,
++                            "urcr_v2/query_eligible_count": float(
++                                global_local_counts[0]
++                            ),
++                            "urcr_v2/think_eligible_count": float(
++                                global_local_counts[1]
++                            ),
++                            "urcr_v2/local_alpha": float(urcr_v2_spec["alpha"]),
++                            "urcr_v2/global_pg_dlogp_l2": float(
++                                global_dlogp_totals[0].sqrt()
++                            ),
++                            "urcr_v2/query_local_dlogp_l2": float(
++                                global_dlogp_totals[1].sqrt()
++                            ),
++                            "urcr_v2/think_local_dlogp_l2": float(
++                                global_dlogp_totals[2].sqrt()
++                            ),
++                            "urcr_v2/combined_local_dlogp_l2": float(
++                                global_dlogp_totals[3].sqrt()
++                            ),
++                            "urcr_v2/combined_over_global_dlogp_l2": float(
++                                global_dlogp_totals[3].sqrt()
++                                / global_dlogp_totals[0].sqrt().clamp_min(1e-30)
++                            ),
++                            "urcr_v2/net_pg_local_dlogp_l2": float(
++                                global_dlogp_totals[4].sqrt()
++                            ),
++                            "urcr_v2/global_combined_local_dlogp_cosine": float(
++                                global_dlogp_totals[5]
++                                / (
++                                    global_dlogp_totals[0]
++                                    * global_dlogp_totals[3]
++                                ).sqrt().clamp_min(1e-30)
++                            ),
++                            "urcr_v2/query_role_global_positive_update_rate": float(
++                                global_dlogp_totals[6]
++                                / global_dlogp_totals[9].clamp_min(1.0)
++                            ),
++                            "urcr_v2/query_role_local_positive_update_rate": float(
++                                global_dlogp_totals[7]
++                                / global_dlogp_totals[9].clamp_min(1.0)
++                            ),
++                            "urcr_v2/query_role_net_positive_update_rate": float(
++                                global_dlogp_totals[8]
++                                / global_dlogp_totals[9].clamp_min(1.0)
++                            ),
++                        },
++                    )
++        if urcr_reduction_totals:
++            keys = sorted(urcr_reduction_totals)
++            values = torch.stack([urcr_reduction_totals[key] for key in keys])
++            if torch.distributed.is_available() and torch.distributed.is_initialized():
++                torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
++                world_size = torch.distributed.get_world_size()
++            else:
++                world_size = 1
++            totals = {key: float(value) for key, value in zip(keys, values.cpu().tolist())}
++            metrics["urcr_actual/denominator_token_sum"] = [totals["denominator_token_sum"]]
++            for role in ("query", "think"):
++                token_count = totals[f"{role}_token_count"]
++                metrics[f"urcr_actual/{role}_token_count"] = [token_count]
++                for suffix in (
++                    "preclip_residual_total",
++                    "postratio_residual_total",
++                    "postclip_surrogate_total",
++                ):
++                    metrics[f"urcr_actual/{role}_{suffix}"] = [totals[f"{role}_{suffix}"]]
++                metrics[f"urcr_actual/{role}_ratio_mean"] = [
++                    totals[f"{role}_ratio_sum"] / max(token_count, 1.0)
++                ]
++                metrics[f"urcr_actual/{role}_clip_fraction"] = [
++                    totals[f"{role}_clipped_token_count"] / max(token_count, 1.0)
++                ]
++                metrics[f"urcr_actual/{role}_reduced_pg_loss_delta"] = [
++                    totals[f"{role}_actual_reduced_pg_loss_delta"] / world_size
++                ]
++        if urcr_same_forward_totals:
++            keys = sorted(urcr_same_forward_totals)
++            values = torch.stack([urcr_same_forward_totals[key] for key in keys])
++            if torch.distributed.is_available() and torch.distributed.is_initialized():
++                torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
++                world_size = torch.distributed.get_world_size()
++            else:
++                world_size = 1
++            for key, value in zip(keys, values.cpu().tolist()):
++                if "/actual_" in key:
++                    value /= world_size
++                metrics[f"urcr_same_forward/{key}"] = [float(value)]
++            metrics["urcr_same_forward/world_size"] = [float(world_size)]
+         self.actor_optimizer.zero_grad()
+         return metrics

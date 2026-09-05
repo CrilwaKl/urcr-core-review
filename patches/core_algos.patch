@@ -1,0 +1,57 @@
+diff --git a/verl/trainer/ppo/core_algos.py b/verl/trainer/ppo/core_algos.py
+index 34df954..cdd70ce 100644
+--- a/verl/trainer/ppo/core_algos.py
++++ b/verl/trainer/ppo/core_algos.py
+@@ -473,6 +473,32 @@ def compute_policy_loss(
+     ratio = torch.exp(negative_approx_kl)
+     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+ 
++    pg_losses, clip_indicator, lower_clip_indicator = compute_policy_loss_matrix(
++        ratio=ratio,
++        advantages=advantages,
++        cliprange=cliprange,
++        cliprange_low=cliprange_low,
++        cliprange_high=cliprange_high,
++        clip_ratio_c=clip_ratio_c,
++    )
++    pg_clipfrac = verl_F.masked_mean(clip_indicator, response_mask)
++    pg_clipfrac_lower = verl_F.masked_mean(lower_clip_indicator, response_mask)
++    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++
++    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
++
++
++def compute_policy_loss_matrix(
++    *,
++    ratio: torch.Tensor,
++    advantages: torch.Tensor,
++    cliprange: float,
++    cliprange_low: float | None,
++    cliprange_high: float | None,
++    clip_ratio_c: float,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Return the exact token-level vanilla PPO loss and clip indicators."""
++    assert clip_ratio_c > 1.0
+     pg_losses1 = -advantages * ratio
+     if cliprange_low is None:
+         cliprange_low = cliprange
+@@ -480,16 +506,14 @@ def compute_policy_loss(
+         cliprange_high = cliprange
+     pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
++    clip_indicator = torch.gt(pg_losses2, pg_losses1).float()
+ 
+     pg_losses3 = -advantages * clip_ratio_c
+     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+-    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
++    lower_clip_indicator = torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float()
+ 
+     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+-
+-    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
++    return pg_losses, clip_indicator, lower_clip_indicator
+ 
+ 
+ def compute_policy_loss_gspo(

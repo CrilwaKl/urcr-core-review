@@ -1,0 +1,58 @@
+defaults:
+  - plan07_answer_agam_core
+  - _self_
+
+algorithm:
+  urcr:
+    source:
+      lambda_a: 0.0
+    support_reward:
+      enable: true
+      version: v2_fixed_local
+      utility_mode: binary_hierarchical
+      base_query_reward: 0.5
+      fact_utility: 1.0
+      doc_only_utility: 0.5
+      multihit_bonus: 0.0
+      multihit_cap: 1.25
+      repeat_reward: 0.0
+      miss_reward: 0.0
+      invalid_reward: 0.0
+      no_metadata_reward: 0.0
+      detach: true
+      insert_into_terminal_reward: false
+      grpo_group_normalize: false
+      outcome_interaction: additive
+    local_objective:
+      mode: separate_eligible_action_mean
+      query_reduction: span_mean
+      think_reduction: n1_reference
+      think_length_ref_source: frozen_median_selected_content
+      think_length_ref: 22.0
+      think_content_only: true
+      query_loss_weight: 1.0
+      think_loss_weight: 1.0
+      lambda_r: 1.0
+      local_max: 0.01
+      warmup_steps: 30
+      use_existing_ppo_clip: true
+      extra_actor_forward: false
+      old_s_local_compatible: false
+    responsibility:
+      score_eligibility: source_active_independent_of_a_out
+    routing:
+      local_scale: null
+    protection:
+      protect_verified_support_query: false
+      protect_routed_think: false
+    audit:
+      compute_q0_shadow: false
+      compute_shadow_modes: false
+      save_surrogate_coefficients: false
+      turn_component_steps: [1, 2, 3, 4, 5, 50, 100, 150, 200, 250, 300]
+
+trainer:
+  project_name: urcr_v2_fixed_support_agam
+  experiment_name: urcr_v2_fixed_support_agam_3b_from_base_300step
+  default_local_dir: /data0/kongmu/agentic-RL/runtime/urcr_v2_fixed_support_agam/rolling_checkpoints
+  save_freq: 25

@@ -1,0 +1,1333 @@
+diff --git a/verl/trainer/ppo/evisd_ray_trainer.py b/verl/trainer/ppo/evisd_ray_trainer.py
+index fbf832b..928d181 100644
+--- a/verl/trainer/ppo/evisd_ray_trainer.py
++++ b/verl/trainer/ppo/evisd_ray_trainer.py
+@@ -4,6 +4,7 @@ from pprint import pprint
+ 
+ import json
+ import os
++import time
+ 
+ import numpy as np
+ import ray
+@@ -11,7 +12,7 @@ import torch
+ from tqdm import tqdm
+ 
+ from verl import DataProto
+-from verl.trainer.ppo.core_algos import agg_loss
++from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
+ from verl.trainer.ppo.ray_trainer import (
+     RayPPOTrainer,
+     _timer,
+@@ -22,11 +23,50 @@ from verl.trainer.ppo.ray_trainer import (
+ )
+ from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+ from verl.trainer.ppo.evisd_teacher import (
+-    build_evisd_action_mask,
+     build_evisd_teacher_batch,
++    build_evisd_typed_action_masks,
+     load_e5_evidence_map,
+ )
+-from verl.trainer.ppo.evisd_utils import apply_evisd_advantage_modulation
++from verl.trainer.ppo.evisd_utils import (
++    apply_evisd_advantage_modulation,
++    build_evisd_advantage_anchors,
++    merge_scoped_teacher_log_probs,
++)
++from verl.trainer.ppo.urcr_diagnostics import (
++    build_frozen_turn_rows,
++    consolidate_frozen_turn_parts,
++    write_frozen_turn_batch,
++)
++from verl.trainer.ppo.urcr_answer_agam import (
++    apply_answer_agam,
++    linear_annealed_answer_lambda,
++    validate_answer_agam_config,
++)
++from verl.trainer.ppo.urcr_metrics import (
++    append_training_batch_record,
++    assert_plan06_training_step_health,
++    assert_selected_profile_advantages,
++    build_training_batch_record,
++    enrich_urcr_components,
++    summarize_urcr_components,
++    write_resolved_config,
++    write_step_metrics,
++    write_turn_component_part,
++)
++from verl.trainer.ppo.urcr_responsibility import (
++    build_response_chunk_tensor,
++    build_response_span_tensor,
++    needs_responsibility_score,
++)
++from verl.trainer.ppo.urcr_localized import MAX_CHUNKS, prepare_think_support
++from verl.trainer.ppo.urcr_local_objective import effective_local_alpha
++from verl.trainer.ppo.urcr_routing import (
++    apply_urcr_routing,
++    build_outcome_anchor,
++    build_v2_local_routing,
++)
++from verl.trainer.ppo.urcr_sources import build_online_g2_rows, validate_plan05_config
++from verl.trainer.ppo.urcr_update_audit import canonicalize_update_audit_batch
+ from verl.utils.metric import reduce_metrics
+ from verl.utils.torch_functional import masked_mean
+ from verl.trainer.ppo.metric_utils import (
+@@ -40,15 +80,54 @@ from verl.trainer.ppo.metric_utils import (
+ from agent_system.multi_turn_rollout import adjust_batch
+ 
+ 
++def resolve_phase_stop_step(
++    *,
++    total_training_steps: int,
++    current_global_step: int,
++    stop_after_steps: int | None,
++) -> int:
++    """Resolve a process boundary without changing the optimizer horizon."""
++    if stop_after_steps is None:
++        return int(total_training_steps)
++    stop_step = int(stop_after_steps)
++    if not 0 < stop_step <= int(total_training_steps):
++        raise ValueError(
++            "trainer.stop_after_steps must be in (0, total_training_steps], got "
++            f"{stop_step} with total_training_steps={total_training_steps}"
++        )
++    if stop_step <= int(current_global_step):
++        raise ValueError(
++            "trainer.stop_after_steps must be greater than the resumed global step, got "
++            f"{stop_step} <= {current_global_step}"
++        )
++    return stop_step
++
++
++def requires_urcr_responsibility(urcr_config) -> bool:
++    """Return whether responsibility affects the selected or requested audit path."""
++    if urcr_config.uses_v2_fixed_support_reward:
++        # g2_full still needs the frozen scorer's chunk-level LOO values even
++        # though its scalar rho is fixed to one.
++        return bool(
++            urcr_config.compute_shadow_modes
++            or urcr_config.method in {"g2_full", "g2_shuffled", "g2_real"}
++        )
++    return bool(
++        urcr_config.compute_shadow_modes
++        or urcr_config.method in {"g2_shuffled", "g2_real"}
++    )
++
++
+ class EviSDRayTrainer(RayPPOTrainer):
+-    """GRPO trainer that replaces broadcast credit with EviSD-modulated credit."""
++    """GRPO trainer with optional upstream EviSD and the active URCR objective."""
+ 
+     def _compute_teacher_log_probs(
+         self,
+         batch: DataProto,
+         teacher_info_out: list | None = None,
+-    ) -> torch.Tensor:
+-        """Re-score the sampled response under its action-aligned privileged context."""
++        score_row_mask: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, int]:
++        """Re-score only rows whose privileged correction can reach the main loss."""
+         evisd_cfg = self.config.algorithm.get("evisd", {})
+         teacher_context = evisd_cfg.get("teacher_context", "evisd")
+ 
+@@ -83,12 +162,56 @@ class EviSDRayTrainer(RayPPOTrainer):
+             teacher_info_out=teacher_info_out,
+             e5_evidence_map=e5_evidence_map,
+         )
+-        teacher_output = self.actor_rollout_wg.compute_log_prob(teacher_batch)
+-        return teacher_output.batch["old_log_probs"]
++        if score_row_mask is None:
++            scored_row_indices = torch.arange(len(batch), dtype=torch.long)
++        else:
++            if score_row_mask.ndim != 1 or len(score_row_mask) != len(batch):
++                raise ValueError(
++                    "EviSD teacher score-row mask must have one value per actor row"
++                )
++            scored_row_indices = torch.nonzero(
++                score_row_mask.detach().cpu().bool(),
++                as_tuple=False,
++            ).flatten()
++
++        scored_flags = torch.zeros(len(batch), dtype=torch.bool)
++        scored_flags[scored_row_indices] = True
++        if teacher_info_out is not None:
++            if len(teacher_info_out) != len(batch):
++                raise RuntimeError("EviSD teacher metadata count does not match actor rows")
++            for index, info in enumerate(teacher_info_out):
++                info["teacher_scored"] = bool(scored_flags[index])
++
++        student_log_probs = batch.batch["old_log_probs"]
++        if not len(scored_row_indices):
++            return student_log_probs.detach().clone(), 0
++        if len(scored_row_indices) == len(batch):
++            teacher_output = self.actor_rollout_wg.compute_log_prob(teacher_batch)
++            return teacher_output.batch["old_log_probs"], len(batch)
++
++        scoped_teacher_batch = teacher_batch.select_idxs(
++            scored_row_indices.numpy()
++        )
++        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
++
++        scoped_teacher_batch, padding_size = pad_dataproto_to_divisor(
++            scoped_teacher_batch,
++            self.actor_rollout_wg.world_size,
++        )
++        teacher_output = self.actor_rollout_wg.compute_log_prob(
++            scoped_teacher_batch
++        )
++        teacher_output = unpad_dataproto(teacher_output, padding_size)
++        teacher_log_probs = merge_scoped_teacher_log_probs(
++            student_log_probs,
++            teacher_output.batch["old_log_probs"],
++            scored_row_indices,
++        )
++        return teacher_log_probs, len(scored_row_indices)
+ 
+     def fit(self):
+         """
+-        Train with the original GRPO advantages modulated by EviSD.
++        Train with the selected outcome-anchored EviSD or URCR objective.
+         """
+         from omegaconf import OmegaConf
+         from verl.utils.tracking import Tracking
+@@ -100,8 +223,113 @@ class EviSDRayTrainer(RayPPOTrainer):
+             config=OmegaConf.to_container(self.config, resolve=True),
+         )
+ 
++        diagnostic_cfg = self.config.algorithm.get("urcr_diagnostics", {})
++        diagnostic_enabled = bool(diagnostic_cfg.get("enable", False))
++        diagnostic_output_dir = diagnostic_cfg.get("output_dir")
++        diagnostic_artifact_prefix = str(diagnostic_cfg.get("output_prefix", ""))
++        if diagnostic_enabled:
++            if not self.config.algorithm.evisd.get("enable", False):
++                raise ValueError("URCR diagnostics require algorithm.evisd.enable=True")
++            if not diagnostic_output_dir:
++                raise ValueError("URCR diagnostics require algorithm.urcr_diagnostics.output_dir")
++            print(
++                "[URCR Plan 02] diagnostic-only mode enabled: "
++                "rollout and scoring will run, optimizer updates are disabled"
++            )
++
++        urcr_config = validate_plan05_config(self.config.algorithm.get("urcr", {}))
++        answer_agam_config = validate_answer_agam_config(
++            self.config.algorithm.get("urcr", {}).get("answer_agam", {})
++        )
++        if answer_agam_config.enabled and not urcr_config.enabled:
++            raise ValueError("AGAM-Core requires the active URCR training path")
++        capture_update_audit = (
++            urcr_config.capture_update_summary or urcr_config.capture_update_vectors
++        )
++        if urcr_config.enabled:
++            if diagnostic_enabled and capture_update_audit:
++                raise ValueError(
++                    "Plan 05 no-update diagnostics cannot capture optimizer update vectors"
++                )
++            evisd_cfg = self.config.algorithm.evisd
++            if bool(evisd_cfg.get("enable", False)):
++                raise ValueError(
++                    "Online URCR uses a pure GRPO outcome anchor; "
++                    "algorithm.evisd.enable must be False"
++                )
++            if bool(evisd_cfg.get("answer_enable", False)):
++                raise ValueError(
++                    "Online URCR forbids privileged answer PI; "
++                    "algorithm.evisd.answer_enable must be False"
++                )
++            if urcr_config.save_surrogate_coefficients and not urcr_config.compute_shadow_modes:
++                raise ValueError(
++                    "Plan05-MIX save_surrogate_coefficients requires compute_shadow_modes=True"
++                )
++            if (
++                urcr_config.uses_v2_fixed_support_reward
++                and urcr_config.compute_shadow_modes
++            ):
++                raise ValueError(
++                    "URCR v2 uses the independent same-forward local objective; "
++                    "legacy compute_shadow_modes must be False"
++                )
++            if urcr_config.save_turn_components and not urcr_config.audit_output_dir:
++                raise ValueError("Plan 05 save_turn_components requires algorithm.urcr.audit.output_dir")
++            responsibility_micro_batch = int(
++                self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
++            )
++            if responsibility_micro_batch <= 0:
++                raise ValueError(
++                    "Online URCR requires a positive base rollout "
++                    "log_prob_micro_batch_size_per_gpu"
++                )
++            print(
++                "[URCR Plan05-MIX] repaired objective enabled: "
++                f"method={urcr_config.method}, routing={urcr_config.routing_mode}, "
++                f"responsibility_micro_batch={responsibility_micro_batch} "
++                "(inherited from rollout log-prob)"
++            )
++            if urcr_config.uses_v2_fixed_support_reward:
++                print(
++                    "[URCR v2] fixed local support objective enabled: "
++                    f"utility={urcr_config.support_reward.utility_mode}, "
++                    f"b_Q={urcr_config.support_reward.base_query_reward}, "
++                    f"kappa_doc={urcr_config.support_reward.doc_only_utility}, "
++                    f"L_ref={urcr_config.local_objective.think_length_ref}, "
++                    f"local_max={urcr_config.local_objective.local_max}, "
++                    f"warmup_steps={urcr_config.local_objective.warmup_steps}"
++                )
++            if answer_agam_config.enabled:
++                print(
++                    "[URCR AGAM-Core] answer-only gold-grounded modulation enabled: "
++                    f"lambda_start={answer_agam_config.lambda_start}, "
++                    f"schedule=linear_to_zero_at_step_{self.total_training_steps}, "
++                    "explicit_mixed_gate=False"
++                )
++        if urcr_config.enabled or capture_update_audit:
++            resolved_config_path = write_resolved_config(
++                OmegaConf.to_container(self.config, resolve=True),
++                output_dir=urcr_config.audit_output_dir,
++            )
++            print(f"[URCR Plan 05] wrote resolved config: {resolved_config_path}")
++
+         self.global_steps = 0
++        checkpoint_load_started = time.perf_counter()
+         self._load_checkpoint()
++        checkpoint_load_seconds = time.perf_counter() - checkpoint_load_started
++        if self.config.trainer.get("exit_after_load", False):
++            print(
++                "[Plan06 checkpoint load-only] "
++                f"global_step={self.global_steps}, wall_seconds={checkpoint_load_seconds:.6f}"
++            )
++            return
++
++        phase_stop_step = resolve_phase_stop_step(
++            total_training_steps=self.total_training_steps,
++            current_global_step=self.global_steps,
++            stop_after_steps=self.config.trainer.get("stop_after_steps"),
++        )
+ 
+         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+             val_metrics = self._validate()
+@@ -111,7 +339,12 @@ class EviSDRayTrainer(RayPPOTrainer):
+             if self.config.trainer.get("val_only", False):
+                 return
+ 
+-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="EviSD Training")
++        progress_description = "URCR Training" if urcr_config.enabled else "EviSD Training"
++        progress_bar = tqdm(
++            total=phase_stop_step,
++            initial=self.global_steps,
++            desc=progress_description,
++        )
+         self.global_steps += 1
+         last_val_metrics = None
+ 
+@@ -119,6 +352,16 @@ class EviSDRayTrainer(RayPPOTrainer):
+             for batch_dict in self.train_dataloader:
+                 metrics = {}
+                 timing_raw = {}
++                urcr_components_to_write = None
++                training_batch_record = None
++                if urcr_config.enabled:
++                    training_batch_record, batch_metrics = build_training_batch_record(
++                        batch_dict,
++                        global_step=self.global_steps,
++                        epoch=epoch,
++                        shuffle_seed=int(self.config.data.get("seed", 1)),
++                    )
++                    metrics.update(batch_metrics)
+                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+ 
+                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+@@ -139,7 +382,7 @@ class EviSDRayTrainer(RayPPOTrainer):
+                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                 )
+ 
+-                is_last_step = self.global_steps >= self.total_training_steps
++                is_last_step = self.global_steps >= phase_stop_step
+ 
+                 with _timer("step", timing_raw):
+                     with _timer("gen", timing_raw):
+@@ -153,7 +396,18 @@ class EviSDRayTrainer(RayPPOTrainer):
+                     del batch
+                     batch = gen_batch_output
+ 
+-                    batch = adjust_batch(self.config, batch)
++                    adjustment_rng = None
++                    if capture_update_audit:
++                        batch = canonicalize_update_audit_batch(batch)
++                        adjustment_rng = np.random.default_rng(
++                            [int(self.config.data.get("seed", 1)), int(self.global_steps)]
++                        )
++                    unadjusted_batch_size = len(batch)
++                    batch = adjust_batch(self.config, batch, rng=adjustment_rng)
++                    if urcr_config.enabled or capture_update_audit:
++                        adjustment_copy = np.zeros(len(batch), dtype=bool)
++                        adjustment_copy[unadjusted_batch_size:] = True
++                        batch.non_tensor_batch["urcr_is_adjustment_copy"] = adjustment_copy
+                     batch.batch["response_mask"] = compute_response_mask(batch)
+ 
+                     if self.config.trainer.balance_batch:
+@@ -182,18 +436,166 @@ class EviSDRayTrainer(RayPPOTrainer):
+                         old_log_prob.batch.pop("entropys")
+                         batch = batch.union(old_log_prob)
+ 
+-                    # Re-score each sampled action with its privileged teacher view.
++                    evisd_cfg = self.config.algorithm.get("evisd", {})
++                    evisd_enabled = bool(evisd_cfg.get("enable", False))
++                    response_mask = batch.batch["response_mask"]
++                    search_action_mask = torch.zeros_like(response_mask)
++                    answer_action_mask = torch.zeros_like(response_mask)
++                    official_action_mask = torch.zeros_like(response_mask)
++                    modulation_mask = torch.zeros_like(response_mask)
++                    score_search = False
++                    answer_enable = False
++                    teacher_score_row_mask = torch.zeros(
++                        len(batch), dtype=torch.bool, device=response_mask.device
++                    )
++                    if evisd_enabled:
++                        if evisd_cfg.get("action_only", False):
++                            (
++                                search_action_mask,
++                                answer_action_mask,
++                                official_action_mask,
++                            ) = build_evisd_typed_action_masks(
++                                batch=batch,
++                                tokenizer=self.tokenizer,
++                                response_mask=response_mask,
++                            )
++                        else:
++                            search_action_mask = response_mask
++                            answer_action_mask = response_mask
++                            official_action_mask = response_mask
++
++                        answer_enable = bool(evisd_cfg.get("answer_enable", True))
++                        search_main = bool(
++                            evisd_cfg.get("search_enable_for_main_loss", True)
++                        )
++                        search_shadow = bool(
++                            evisd_cfg.get("search_shadow_enable", False)
++                        )
++                        score_search = search_main or (
++                            urcr_config.enabled and search_shadow
++                        )
++                        if score_search:
++                            modulation_mask = modulation_mask + search_action_mask
++                        if answer_enable:
++                            modulation_mask = modulation_mask + answer_action_mask
++                        modulation_mask = modulation_mask.clamp(max=1)
++                        if score_search and answer_enable and not torch.equal(
++                            modulation_mask.bool(),
++                            official_action_mask.bool(),
++                        ):
++                            raise RuntimeError(
++                                "Typed EviSD masks do not reconstruct the official action mask"
++                            )
++                        if evisd_cfg.get("action_only", False):
++                            teacher_score_row_mask = modulation_mask.bool().any(dim=-1)
++                        else:
++                            teacher_score_row_mask = torch.ones(
++                                len(batch),
++                                dtype=torch.bool,
++                                device=response_mask.device,
++                            )
++
++                    # Re-score only actions whose PI correction reaches the selected objective.
+                     with _timer("teacher_forward", timing_raw):
+-                        evisd_cfg = self.config.algorithm.get("evisd", {})
+                         _save_case_study = (
+                             evisd_cfg.get("save_case_study", False)
+                             and evisd_cfg.get("enable", False)
+                             and self.config.trainer.test_freq > 0
+                             and self.global_steps % self.config.trainer.test_freq == 0
+                         )
+-                        _teacher_info = [] if _save_case_study else None
+-                        teacher_log_probs = self._compute_teacher_log_probs(batch, teacher_info_out=_teacher_info)
++                        _capture_intermediates = (
++                            _save_case_study
++                            or diagnostic_enabled
++                            or urcr_config.enabled
++                            or capture_update_audit
++                        )
++                        _teacher_info = [] if _capture_intermediates else None
++                        if evisd_enabled:
++                            teacher_log_probs, teacher_scored_rows = (
++                                self._compute_teacher_log_probs(
++                                    batch,
++                                    teacher_info_out=_teacher_info,
++                                    score_row_mask=teacher_score_row_mask,
++                                )
++                            )
++                        else:
++                            # The URCR-only path must not construct or score an
++                            # EviSD privileged teacher prompt.  Preserve neutral
++                            # tensor shapes solely for the frozen-turn exporter.
++                            teacher_log_probs = batch.batch["old_log_probs"].detach().clone()
++                            teacher_scored_rows = 0
++                            if _teacher_info is not None:
++                                _teacher_info.extend(
++                                    {"teacher_scored": False} for _ in range(len(batch))
++                                )
+                         batch.batch["teacher_log_probs"] = teacher_log_probs
++                        metrics["evisd/teacher_scored_row_count"] = float(
++                            teacher_scored_rows
++                        )
++                        metrics["evisd/teacher_skipped_row_count"] = float(
++                            len(batch) - teacher_scored_rows
++                        )
++                        metrics["evisd/teacher_scored_row_ratio"] = float(
++                            teacher_scored_rows / max(1, len(batch))
++                        )
++                        answer_row_mask = answer_action_mask.bool().any(dim=-1)
++                        search_row_mask = search_action_mask.bool().any(dim=-1)
++                        expected_teacher_row_mask = torch.zeros_like(
++                            teacher_score_row_mask
++                        )
++                        if score_search:
++                            expected_teacher_row_mask |= search_row_mask
++                        if answer_enable:
++                            expected_teacher_row_mask |= answer_row_mask
++                        if not torch.equal(
++                            teacher_score_row_mask.bool(),
++                            expected_teacher_row_mask.bool(),
++                        ):
++                            raise RuntimeError(
++                                "EviSD scoped teacher rows diverge from the active action mask"
++                            )
++                        metrics["evisd/teacher_answer_row_count"] = float(
++                            answer_row_mask.sum().item()
++                        )
++                        metrics[
++                            "evisd/teacher_scored_search_only_row_count"
++                        ] = float(
++                            (
++                                teacher_score_row_mask.bool()
++                                & search_row_mask
++                                & ~answer_row_mask
++                            ).sum().item()
++                        )
++                        skipped_rows = ~teacher_score_row_mask.bool()
++                        if skipped_rows.any():
++                            skipped_delta_max = float(
++                                (
++                                    teacher_log_probs[skipped_rows]
++                                    - batch.batch["old_log_probs"][skipped_rows]
++                                ).abs().max().item()
++                            )
++                        else:
++                            skipped_delta_max = 0.0
++                        if skipped_delta_max != 0.0:
++                            raise RuntimeError(
++                                "Unscored EviSD teacher rows must have exactly zero delta"
++                            )
++                        metrics[
++                            "evisd/teacher_skipped_delta_max"
++                        ] = skipped_delta_max
++                        if urcr_config.enabled:
++                            if teacher_scored_rows or teacher_score_row_mask.any().item():
++                                raise RuntimeError(
++                                    "URCR-only path must not score privileged teacher rows"
++                                )
++                            if not torch.equal(
++                                teacher_log_probs,
++                                batch.batch["old_log_probs"].detach(),
++                            ):
++                                raise RuntimeError(
++                                    "URCR-only neutral teacher tensor diverged from actor log probabilities"
++                                )
++                            metrics["urcr/privileged_teacher_scored_row_count"] = 0.0
+ 
+                     if self.use_reference_policy:
+                         with _timer("ref", timing_raw):
+@@ -254,20 +656,9 @@ class EviSDRayTrainer(RayPPOTrainer):
+                         student_log_probs = batch.batch["old_log_probs"]
+                         teacher_lp = batch.batch["teacher_log_probs"]
+ 
+-                        evisd_cfg = self.config.algorithm.get("evisd", {})
+                         _evisd_intermediates = None
+-                        modulation_mask = None
+-                        if evisd_cfg.get("enable", False):
+-                            if evisd_cfg.get("action_only", False):
+-                                # Localize privileged guidance to generated action spans.
+-                                modulation_mask = build_evisd_action_mask(
+-                                    batch=batch,
+-                                    tokenizer=self.tokenizer,
+-                                    response_mask=response_mask,
+-                                    include_search=evisd_cfg.get("include_search", True),
+-                                    include_answer=evisd_cfg.get("include_answer", True),
+-                                )
+-
++                        _evisd_anchors = None
++                        if evisd_enabled:
+                             # Apply the bounded beta-scaled teacher-student correction.
+                             modulation_result = apply_evisd_advantage_modulation(
+                                 advantages=batch.batch["advantages"],
+@@ -277,9 +668,9 @@ class EviSDRayTrainer(RayPPOTrainer):
+                                 modulation_mask=modulation_mask,
+                                 beta=evisd_cfg.get("beta", 1.5),
+                                 evisd_lambda=evisd_cfg.get("lambda", 0.2),
+-                                return_intermediates=_save_case_study,
++                                return_intermediates=_capture_intermediates,
+                             )
+-                            if _save_case_study:
++                            if _capture_intermediates:
+                                 (
+                                     batch.batch["advantages"],
+                                     evisd_metrics,
+@@ -288,13 +679,616 @@ class EviSDRayTrainer(RayPPOTrainer):
+                             else:
+                                 batch.batch["advantages"], evisd_metrics = modulation_result
+                             metrics.update(evisd_metrics)
++                            if urcr_config.enabled:
++                                _evisd_anchors = build_evisd_advantage_anchors(
++                                    outcome_advantages=_evisd_intermediates["advantages_before"],
++                                    evisd_bonus=_evisd_intermediates["evisd_bonus"],
++                                    response_mask=response_mask,
++                                    search_mask=search_action_mask,
++                                    answer_mask=answer_action_mask,
++                                )
++                                if urcr_config.compute_q0_shadow:
++                                    metrics["evisd/q0_shadow_abs_mean"] = masked_mean(
++                                        _evisd_anchors["q0_shadow"].abs(),
++                                        search_action_mask,
++                                    ).item()
++                                metrics["evisd/answer_bonus_abs_mean"] = masked_mean(
++                                    _evisd_anchors["answer_bonus"].abs(),
++                                    answer_action_mask,
++                                ).item()
++                        elif urcr_config.enabled:
++                            outcome_anchor = build_outcome_anchor(
++                                batch.batch["advantages"],
++                                response_mask,
++                            )
++                            zero = torch.zeros_like(outcome_anchor)
++                            _evisd_intermediates = {
++                                "delta": zero,
++                                "evisd_score": zero,
++                                "evisd_bonus": zero,
++                                "advantages_before": outcome_anchor,
++                            }
++                            _evisd_anchors = {"outcome": outcome_anchor}
+ 
+-                        delta_t = (teacher_lp - student_log_probs) * response_mask
+-                        metrics["evisd/teacher_student_gap_mean"] = masked_mean(delta_t, response_mask).item()
+-                        metrics["evisd/teacher_student_gap_std"] = masked_mean(
+-                            delta_t ** 2,
+-                            response_mask,
+-                        ).sqrt().item()
++                        if urcr_config.enabled:
++                            if (
++                                _evisd_intermediates is None
++                                or _evisd_anchors is None
++                                or _teacher_info is None
++                            ):
++                                raise RuntimeError("Plan 05 requires captured EviSD intermediates")
++                            urcr_action_mask = (
++                                modulation_mask
++                                if modulation_mask is not None
++                                else torch.zeros_like(response_mask)
++                            )
++                            with _timer("urcr_source", timing_raw):
++                                frozen_rows, _ = build_frozen_turn_rows(
++                                    batch=batch,
++                                    tokenizer=self.tokenizer,
++                                    teacher_info=_teacher_info,
++                                    evisd_intermediates=_evisd_intermediates,
++                                    modulation_mask=urcr_action_mask,
++                                    global_step=self.global_steps,
++                                    include_search_modulation=score_search,
++                                    include_answer_modulation=answer_enable,
++                                    include_token_char_offsets=answer_agam_config.enabled,
++                                )
++                                if urcr_config.think_credit_mode != "whole_old":
++                                    include_chunks = urcr_config.think_credit_mode in {
++                                        "loo_mass50",
++                                        "random_matched",
++                                    }
++                                    for frozen in frozen_rows:
++                                        frozen.update(
++                                            prepare_think_support(
++                                                self.tokenizer,
++                                                response_token_ids=frozen[
++                                                    "response_token_ids"
++                                                ],
++                                                think_mask=frozen["think_mask"],
++                                                include_chunks=include_chunks,
++                                            )
++                                        )
++                                source_rows = build_online_g2_rows(
++                                    frozen_rows,
++                                    source_enabled=urcr_config.source_enabled,
++                                    support_reward=urcr_config.support_reward,
++                                )
++
++                            requires_responsibility = requires_urcr_responsibility(
++                                urcr_config
++                            )
++                            score_indices = []
++                            seen_score_turns = set()
++                            for index, (frozen, source) in enumerate(zip(frozen_rows, source_rows)):
++                                turn_uid = str(frozen["turn_uid"])
++                                if (
++                                    requires_responsibility
++                                    and urcr_config.source_enabled
++                                    and (
++                                        urcr_config.uses_v2_fixed_support_reward
++                                        or urcr_config.lambda_a > 0
++                                    )
++                                    and needs_responsibility_score(frozen, source)
++                                    and turn_uid not in seen_score_turns
++                                ):
++                                    score_indices.append(index)
++                                    seen_score_turns.add(turn_uid)
++                            responsibility = {}
++                            if score_indices:
++                                with _timer("urcr_responsibility", timing_raw):
++                                    score_batch = batch.select_idxs(np.asarray(score_indices))
++                                    score_batch.batch["urcr_think_mask"] = build_response_span_tensor(
++                                        batch.batch["response_mask"],
++                                        score_indices,
++                                        frozen_rows,
++                                        "think_mask",
++                                    )
++                                    score_batch.batch["urcr_query_mask"] = build_response_span_tensor(
++                                        batch.batch["response_mask"],
++                                        score_indices,
++                                        frozen_rows,
++                                        "search_content_mask",
++                                    )
++                                    if urcr_config.think_credit_mode in {
++                                        "loo_mass50",
++                                        "random_matched",
++                                    }:
++                                        (
++                                            score_batch.batch["urcr_chunk_mask"],
++                                            score_batch.batch["urcr_chunk_count"],
++                                        ) = build_response_chunk_tensor(
++                                            batch.batch["response_mask"],
++                                            score_indices,
++                                            frozen_rows,
++                                            max_chunks=MAX_CHUNKS,
++                                        )
++                                    score_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
++                                    score_batch.meta_info["urcr_micro_batch_size"] = int(
++                                        self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
++                                    )
++                                    from verl.protocol import (
++                                        pad_dataproto_to_divisor,
++                                        unpad_dataproto,
++                                    )
++
++                                    score_batch, scorer_padding = pad_dataproto_to_divisor(
++                                        score_batch,
++                                        self.actor_rollout_wg.world_size,
++                                    )
++                                    scorer_output = self.actor_rollout_wg.compute_urcr_responsibility(score_batch)
++                                    if "urcr_scorer_forward_batch_count" in scorer_output.batch:
++                                        forward_batches = scorer_output.batch[
++                                            "urcr_scorer_forward_batch_count"
++                                        ]
++                                        if int(forward_batches.min()) != int(
++                                            forward_batches.max()
++                                        ):
++                                            raise RuntimeError(
++                                                "URCR scorer reported unequal FSDP forward batch counts"
++                                            )
++                                        metrics[
++                                            "urcr/scorer_forward_batches_per_rank"
++                                        ] = float(forward_batches.max())
++                                    if "urcr_localizer_padding_variant_count" in scorer_output.batch:
++                                        padding_counts = scorer_output.batch[
++                                            "urcr_localizer_padding_variant_count"
++                                        ]
++                                        rows_per_rank = len(padding_counts) // self.actor_rollout_wg.world_size
++                                        if rows_per_rank * self.actor_rollout_wg.world_size != len(
++                                            padding_counts
++                                        ):
++                                            raise RuntimeError(
++                                                "URCR scorer padding audit lost equal rank shards"
++                                            )
++                                        metrics[
++                                            "urcr/localizer_padding_variant_count"
++                                        ] = float(
++                                            padding_counts.reshape(
++                                                self.actor_rollout_wg.world_size,
++                                                rows_per_rank,
++                                            )[:, 0].sum()
++                                        )
++                                    scorer_output = unpad_dataproto(
++                                        scorer_output, scorer_padding
++                                    )
++                                    score_batch = unpad_dataproto(
++                                        score_batch, scorer_padding
++                                    )
++                                if not scorer_output.batch["urcr_scorer_no_grad"].all().item():
++                                    raise RuntimeError("Plan 05 responsibility scorer no-grad audit failed")
++                                if not scorer_output.batch["urcr_backend_restored"].all().item():
++                                    raise RuntimeError("Plan 05 responsibility scorer did not restore attention backend")
++                                for output_index, batch_index in enumerate(score_indices):
++                                    turn_uid = str(frozen_rows[batch_index]["turn_uid"])
++                                    query_mask = score_batch.batch["urcr_query_mask"][output_index].bool()
++                                    full_values = scorer_output.batch["urcr_full_query_log_probs"][output_index][query_mask]
++                                    masked_values = scorer_output.batch["urcr_masked_query_log_probs"][output_index][query_mask]
++                                    old_values = score_batch.batch["old_log_probs"][output_index][query_mask]
++                                    errors = (full_values - old_values).abs()
++                                    responsibility[turn_uid] = {
++                                        "d_mask": float(scorer_output.batch["urcr_d_mask"][output_index]),
++                                        "rho": float(scorer_output.batch["urcr_rho"][output_index]),
++                                        "rho_scored": True,
++                                        "full_query_logp_token": full_values.tolist(),
++                                        "masked_query_logp_token": masked_values.tolist(),
++                                        "old_query_logp_token": old_values.tolist(),
++                                        "full_old_mean_abs_error": float(errors.mean()),
++                                        "full_old_max_token_error": float(errors.max()),
++                                    }
++                                    if "urcr_chunk_loo_scores" in scorer_output.batch:
++                                        chunk_count = int(
++                                            scorer_output.batch["urcr_chunk_count"]
++                                            [output_index]
++                                        )
++                                        chunk_scores = scorer_output.batch[
++                                            "urcr_chunk_loo_scores"
++                                        ][output_index, :chunk_count]
++                                        responsibility[turn_uid].update(
++                                            {
++                                                "chunk_loo_scores": chunk_scores.tolist(),
++                                                "localizer_forward_count": int(
++                                                    scorer_output.batch[
++                                                        "urcr_localizer_forward_count"
++                                                    ][output_index]
++                                                ),
++                                            }
++                                        )
++
++                            with _timer("urcr_routing", timing_raw):
++                                urcr_anchor = _evisd_anchors["outcome"]
++                                profile_advantages = {}
++                                profile_components = {}
++                                routing_profiles = {
++                                    "g2_query_only": "zero",
++                                    "g2_full": "full",
++                                    "g2_shuffled": "shuffled",
++                                    "g2_real": "real",
++                                }
++                                urcr_v2_local_tensors = None
++                                if urcr_config.uses_v2_fixed_support_reward:
++                                    urcr_v2_local_tensors, urcr_components = (
++                                        build_v2_local_routing(
++                                            response_mask,
++                                            frozen_rows,
++                                            source_rows,
++                                            responsibility,
++                                            base_query_reward=(
++                                                urcr_config.support_reward.base_query_reward
++                                            ),
++                                            lambda_r=urcr_config.local_objective.lambda_r,
++                                            mode=urcr_config.routing_mode,
++                                            shuffle_seed=urcr_config.shuffle_seed,
++                                            think_length_ref=(
++                                                urcr_config.local_objective.think_length_ref
++                                            ),
++                                            positive_mass_fraction=(
++                                                urcr_config.positive_mass_fraction
++                                            ),
++                                        )
++                                    )
++                                    selected_advantages = urcr_anchor.detach().clone()
++                                    profile_advantages[urcr_config.method] = selected_advantages
++                                    profile_components[urcr_config.method] = urcr_components
++                                else:
++                                    methods_to_route = (
++                                        tuple(routing_profiles)
++                                        if urcr_config.compute_shadow_modes
++                                        else (
++                                            (urcr_config.method,)
++                                            if urcr_config.method in routing_profiles
++                                            else ()
++                                        )
++                                    )
++                                    for method_name in methods_to_route:
++                                        routed, components = apply_urcr_routing(
++                                            urcr_anchor,
++                                            response_mask,
++                                            frozen_rows,
++                                            source_rows,
++                                            responsibility,
++                                            lambda_a=urcr_config.lambda_a,
++                                            lambda_r=urcr_config.lambda_r,
++                                            mode=routing_profiles[method_name],
++                                            shuffle_seed=urcr_config.shuffle_seed,
++                                            think_credit_mode=urcr_config.think_credit_mode,
++                                            whole_fix_scale=urcr_config.whole_fix_scale,
++                                            local_scale=urcr_config.local_scale,
++                                            positive_mass_fraction=urcr_config.positive_mass_fraction,
++                                            localizer_seed=urcr_config.localizer_seed,
++                                        )
++                                        profile_advantages[method_name] = routed
++                                        profile_components[method_name] = components
++
++                                    if urcr_config.method in profile_components:
++                                        urcr_components = profile_components[urcr_config.method]
++                                    else:
++                                        _, urcr_components = apply_urcr_routing(
++                                            urcr_anchor,
++                                            response_mask,
++                                            frozen_rows,
++                                            source_rows,
++                                            responsibility,
++                                            lambda_a=0.0,
++                                            lambda_r=0.0,
++                                            mode="zero",
++                                            shuffle_seed=urcr_config.shuffle_seed,
++                                            think_credit_mode=urcr_config.think_credit_mode,
++                                            whole_fix_scale=urcr_config.whole_fix_scale,
++                                            local_scale=urcr_config.local_scale,
++                                            positive_mass_fraction=urcr_config.positive_mass_fraction,
++                                            localizer_seed=urcr_config.localizer_seed,
++                                        )
++                                    selected_advantages = profile_advantages[urcr_config.method]
++
++                                if urcr_config.compute_shadow_modes:
++                                    missing_profiles = set(routing_profiles) - set(profile_advantages)
++                                    if missing_profiles:
++                                        raise RuntimeError(
++                                            "Plan05-MIX profile construction is incomplete: "
++                                            f"{sorted(missing_profiles)}"
++                                        )
++                                    real_components = profile_components["g2_real"]
++                                    shuffled_components = profile_components["g2_shuffled"]
++                                    eligible_pairs = [
++                                        (real, shuffled)
++                                        for real, shuffled in zip(
++                                            real_components,
++                                            shuffled_components,
++                                        )
++                                        if real["c_query_total"] > 0
++                                        and real["think_token_count"] > 0
++                                        and not real["is_adjustment_copy"]
++                                    ]
++                                    real_rho = sorted(pair[0]["rho_used"] for pair in eligible_pairs)
++                                    shuffled_rho = sorted(
++                                        pair[1]["rho_used"] for pair in eligible_pairs
++                                    )
++                                    rho_marginal_error = max(
++                                        [
++                                            abs(left - right)
++                                            for left, right in zip(real_rho, shuffled_rho)
++                                        ]
++                                        + [0.0]
++                                    )
++                                    metrics[
++                                        "urcr_shadow/real_shuffled_rho_marginal_max_error"
++                                    ] = rho_marginal_error
++                                    metrics[
++                                        "urcr_shadow/real_shuffled_pairing_changed_count"
++                                    ] = float(
++                                        sum(
++                                            abs(real["rho_used"] - shuffled["rho_used"])
++                                            > 1e-12
++                                            for real, shuffled in eligible_pairs
++                                        )
++                                    )
++                                    metrics[
++                                        "urcr_shadow/real_shuffled_eligible_count"
++                                    ] = float(len(eligible_pairs))
++                                    actor_loss_mask = (
++                                        batch.batch["loss_mask"][:, -response_mask.shape[1] :]
++                                        if self.config.actor_rollout_ref.rollout.multi_turn.enable
++                                        else response_mask
++                                    )
++                                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
++                                    pg_loss_coef = self.config.actor_rollout_ref.actor.get("pg_loss_coef", 1.0)
++                                    common_actor_loss = torch.zeros(
++                                        (), dtype=urcr_anchor.dtype, device=urcr_anchor.device
++                                    )
++                                    entropy_coeff = self.config.actor_rollout_ref.actor.entropy_coeff
++                                    if entropy_coeff != 0:
++                                        shadow_entropy_loss = agg_loss(
++                                            loss_mat=entropys,
++                                            loss_mask=actor_loss_mask,
++                                            loss_agg_mode=loss_agg_mode,
++                                        )
++                                        common_actor_loss -= shadow_entropy_loss * entropy_coeff
++                                        metrics["urcr_shadow/common_entropy_loss"] = shadow_entropy_loss.item()
++                                    if self.config.actor_rollout_ref.actor.use_kl_loss:
++                                        shadow_kld = kl_penalty(
++                                            logprob=student_log_probs,
++                                            ref_logprob=batch.batch["ref_log_prob"],
++                                            kl_penalty=self.config.actor_rollout_ref.actor.kl_loss_type,
++                                        )
++                                        shadow_kl_loss = agg_loss(
++                                            loss_mat=shadow_kld,
++                                            loss_mask=actor_loss_mask,
++                                            loss_agg_mode=loss_agg_mode,
++                                        )
++                                        common_actor_loss += (
++                                            shadow_kl_loss
++                                            * self.config.actor_rollout_ref.actor.kl_loss_coef
++                                        )
++                                        metrics["urcr_shadow/common_kl_loss"] = shadow_kl_loss.item()
++                                    for profile_name in routing_profiles:
++                                        shadow_advantages = profile_advantages[profile_name]
++                                        shadow_pg_loss = agg_loss(
++                                            loss_mat=-shadow_advantages,
++                                            loss_mask=actor_loss_mask,
++                                            loss_agg_mode=loss_agg_mode,
++                                        )
++                                        metrics[f"urcr_shadow/{profile_name}_pg_loss_ratio1"] = (
++                                            shadow_pg_loss.item()
++                                        )
++                                        metrics[f"urcr_shadow/{profile_name}_actor_loss_ratio1"] = (
++                                            shadow_pg_loss * pg_loss_coef + common_actor_loss
++                                        ).item()
++                                    if urcr_config.save_surrogate_coefficients:
++                                        for profile_name in routing_profiles:
++                                            batch.batch[
++                                                f"urcr_profile_adv_{profile_name}"
++                                            ] = profile_advantages[profile_name]
++
++                                if answer_agam_config.enabled:
++                                    with _timer("answer_agam", timing_raw):
++                                        effective_answer_lambda = (
++                                            linear_annealed_answer_lambda(
++                                                answer_agam_config.lambda_start,
++                                                global_step=self.global_steps,
++                                                total_training_steps=self.total_training_steps,
++                                            )
++                                        )
++                                        agam_application = apply_answer_agam(
++                                            selected_advantages,
++                                            urcr_anchor,
++                                            response_mask,
++                                            frozen_rows,
++                                            self.tokenizer,
++                                            lambda_effective=effective_answer_lambda,
++                                        )
++                                        selected_advantages = agam_application.advantages
++                                        profile_advantages[
++                                            urcr_config.method
++                                        ] = selected_advantages
++                                        metrics.update(agam_application.metrics)
++                                        metrics["agam/lambda_start"] = float(
++                                            answer_agam_config.lambda_start
++                                        )
++                                        metrics["agam/lambda_effective"] = float(
++                                            effective_answer_lambda
++                                        )
++                                        metrics["agam/anneal_progress"] = float(
++                                            1.0
++                                            - effective_answer_lambda
++                                            / answer_agam_config.lambda_start
++                                            if answer_agam_config.lambda_start > 0
++                                            else 1.0
++                                        )
++                                        actor_loss_mask = (
++                                            batch.batch["loss_mask"][
++                                                :, -response_mask.shape[1] :
++                                            ]
++                                            if self.config.actor_rollout_ref.rollout.multi_turn.enable
++                                            else response_mask
++                                        )
++                                        metrics["agam/residual_pg_loss_ratio1"] = float(
++                                            agg_loss(
++                                                loss_mat=-agam_application.residual,
++                                                loss_mask=actor_loss_mask,
++                                                loss_agg_mode=(
++                                                    self.config.actor_rollout_ref.actor.loss_agg_mode
++                                                ),
++                                            ).item()
++                                        )
++                                    for frozen in frozen_rows:
++                                        frozen.pop("_token_char_offsets", None)
++                                all_row_indices = list(range(len(frozen_rows)))
++                                query_span_mask = build_response_span_tensor(
++                                    response_mask,
++                                    all_row_indices,
++                                    frozen_rows,
++                                    "search_content_mask",
++                                )
++                                think_span_mask = build_response_span_tensor(
++                                    response_mask,
++                                    all_row_indices,
++                                    frozen_rows,
++                                    "think_mask",
++                                )
++                                urcr_residual = (
++                                    selected_advantages - urcr_anchor
++                                    if urcr_config.method.startswith("g2_")
++                                    else torch.zeros_like(urcr_anchor)
++                                )
++                                if urcr_config.think_credit_mode != "whole_old":
++                                    think_tag_mask = build_response_span_tensor(
++                                        response_mask,
++                                        all_row_indices,
++                                        frozen_rows,
++                                        "think_tag_mask",
++                                    )
++                                    tag_residual = (
++                                        urcr_residual * think_tag_mask
++                                    ).detach()
++                                    metrics[
++                                        "urcr/localized_tag_residual_nonzero_count"
++                                    ] = float(torch.count_nonzero(tag_residual))
++                                    metrics[
++                                        "urcr/localized_tag_residual_max_abs"
++                                    ] = float(
++                                        tag_residual.abs().max()
++                                        if tag_residual.numel()
++                                        else 0.0
++                                    )
++                                if not urcr_config.uses_v2_fixed_support_reward:
++                                    batch.batch["urcr_query_span_mask"] = query_span_mask
++                                    batch.batch["urcr_think_span_mask"] = think_span_mask
++                                    batch.batch["urcr_query_residual"] = (
++                                        urcr_residual * query_span_mask
++                                    )
++                                    batch.batch["urcr_think_residual"] = (
++                                        urcr_residual * think_span_mask
++                                    )
++                                batch.batch["advantages"] = selected_advantages
++                                if urcr_v2_local_tensors is not None:
++                                    for key, value in urcr_v2_local_tensors.items():
++                                        batch.batch[key] = value.detach()
++                                    warmup_steps = urcr_config.local_objective.warmup_steps
++                                    local_warmup_fraction = (
++                                        1.0
++                                        if warmup_steps == 0
++                                        else min(1.0, self.global_steps / warmup_steps)
++                                    )
++                                    local_alpha = effective_local_alpha(
++                                        local_max=urcr_config.local_objective.local_max,
++                                        global_step=self.global_steps,
++                                        warmup_steps=warmup_steps,
++                                    )
++                                    batch.meta_info["urcr_v2_local_objective"] = {
++                                        "alpha": float(local_alpha),
++                                        "query_loss_weight": float(
++                                            urcr_config.local_objective.query_loss_weight
++                                        ),
++                                        "think_loss_weight": float(
++                                            urcr_config.local_objective.think_loss_weight
++                                        ),
++                                        "think_length_ref": float(
++                                            urcr_config.local_objective.think_length_ref
++                                        ),
++                                    }
++                                    metrics["urcr_v2/local_max"] = float(
++                                        urcr_config.local_objective.local_max
++                                    )
++                                    metrics["urcr_v2/local_warmup_fraction"] = float(
++                                        local_warmup_fraction
++                                    )
++                                    metrics["urcr_v2/local_alpha"] = float(local_alpha)
++                                metrics[
++                                    "urcr/selected_profile_advantage_max_error"
++                                ] = assert_selected_profile_advantages(
++                                    batch.batch["advantages"],
++                                    profile_advantages[urcr_config.method],
++                                    method=urcr_config.method,
++                                )
++                                selected_profile_key = (
++                                    f"urcr_profile_adv_{urcr_config.method}"
++                                )
++                                if selected_profile_key in batch.batch:
++                                    if answer_agam_config.enabled:
++                                        batch.batch[selected_profile_key] = selected_advantages
++                                    assert_selected_profile_advantages(
++                                        batch.batch["advantages"],
++                                        batch.batch[selected_profile_key],
++                                        method=urcr_config.method,
++                                    )
++                                if urcr_config.compute_q0_shadow:
++                                    batch.batch["urcr_q0_shadow"] = _evisd_anchors[
++                                        "q0_shadow"
++                                    ]
++                                urcr_components = enrich_urcr_components(
++                                    urcr_components,
++                                    frozen_rows=frozen_rows,
++                                    response_mask=response_mask,
++                                    final_advantages=selected_advantages,
++                                    evisd_bonus=_evisd_intermediates["evisd_bonus"],
++                                    responsibility=responsibility,
++                                    global_step=self.global_steps,
++                                )
++                                for component in urcr_components:
++                                    component["method"] = urcr_config.method
++                                metrics.update(summarize_urcr_components(urcr_components))
++                                if urcr_config.save_turn_components and (
++                                    urcr_config.turn_component_steps is None
++                                    or self.global_steps in urcr_config.turn_component_steps
++                                ):
++                                    urcr_components_to_write = urcr_components
++
++                        if urcr_config.capture_update_vectors:
++                            if _evisd_intermediates is None or _teacher_info is None:
++                                raise RuntimeError("Plan 05 update audit requires captured EviSD intermediates")
++                            update_audit_mask = (
++                                modulation_mask
++                                if modulation_mask is not None
++                                else torch.zeros_like(response_mask)
++                            )
++                            with _timer("urcr_update_audit_dump", timing_raw):
++                                frozen_path, query_path = write_frozen_turn_batch(
++                                    batch=batch,
++                                    tokenizer=self.tokenizer,
++                                    teacher_info=_teacher_info,
++                                    evisd_intermediates=_evisd_intermediates,
++                                    modulation_mask=update_audit_mask,
++                                    output_dir=urcr_config.audit_output_dir,
++                                    global_step=self.global_steps,
++                                    artifact_prefix="update_audit_",
++                                )
++                            print(
++                                "[URCR Plan 05] wrote update-audit frozen batch: "
++                                f"{frozen_path}, {query_path}"
++                            )
++
++                        if evisd_enabled:
++                            delta_t = (teacher_lp - student_log_probs) * response_mask
++                            metrics["evisd/teacher_student_gap_mean"] = masked_mean(
++                                delta_t,
++                                response_mask,
++                            ).item()
++                            metrics["evisd/teacher_student_gap_std"] = masked_mean(
++                                delta_t ** 2,
++                                response_mask,
++                            ).sqrt().item()
+                         metrics.update(compute_group_reward_separability_metrics(batch=batch))
+                         metrics.update(
+                             compute_traj_credit_metrics(
+@@ -410,19 +1404,58 @@ class EviSDRayTrainer(RayPPOTrainer):
+                             print(f"[EviSD Case Study] Saved {total_saved} samples "
+                                   f"({len(selected_groups)} groups, {len(paired_groups[:n_groups])} paired) to {save_path}")
+ 
+-                    if self.use_critic:
+-                        with _timer("update_critic", timing_raw):
+-                            critic_output = self.critic_wg.update_critic(batch)
+-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+-                        metrics.update(critic_output_metrics)
+-
+-                    if self.config.trainer.critic_warmup <= self.global_steps:
+-                        with _timer("update_actor", timing_raw):
+-                            # Standard GRPO update using the EviSD-modulated advantages.
+-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+-                        metrics.update(actor_output_metrics)
++                    if diagnostic_enabled:
++                        if _evisd_intermediates is None or _teacher_info is None:
++                            raise RuntimeError("URCR diagnostic intermediates were not captured")
++                        diagnostic_mask = (
++                            modulation_mask
++                            if modulation_mask is not None
++                            else torch.zeros_like(batch.batch["response_mask"])
++                        )
++                        with _timer("urcr_diagnostic_dump", timing_raw):
++                            frozen_path, query_path = write_frozen_turn_batch(
++                                batch=batch,
++                                tokenizer=self.tokenizer,
++                                teacher_info=_teacher_info,
++                                evisd_intermediates=_evisd_intermediates,
++                                modulation_mask=diagnostic_mask,
++                                output_dir=diagnostic_output_dir,
++                                global_step=self.global_steps,
++                                artifact_prefix=diagnostic_artifact_prefix,
++                            )
++                        print(
++                            "[URCR] wrote no-update diagnostic parts: "
++                            f"{frozen_path}, {query_path}"
++                        )
++                        metrics["urcr_diagnostics/no_optimizer_update"] = 1.0
++                    else:
++                        if self.use_critic:
++                            with _timer("update_critic", timing_raw):
++                                critic_output = self.critic_wg.update_critic(batch)
++                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
++                            metrics.update(critic_output_metrics)
++
++                        if self.config.trainer.critic_warmup <= self.global_steps:
++                            with _timer("update_actor", timing_raw):
++                                # Standard GRPO update using the selected outcome/URCR advantages.
++                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
++                                if capture_update_audit:
++                                    batch.meta_info["urcr_update_audit"] = {
++                                        "reference_dir": urcr_config.update_reference_dir,
++                                        "save_reference": urcr_config.save_update_reference,
++                                        "compare_reference": urcr_config.compare_update_reference,
++                                        "summary_only": urcr_config.capture_update_summary,
++                                    }
++                                actor_output = self.actor_rollout_wg.update_actor(batch)
++                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
++                            metrics.update(actor_output_metrics)
++                            if self.config.trainer.get("checkpoint_rotation", {}).get(
++                                "enable", False
++                            ):
++                                assert_plan06_training_step_health(
++                                    metrics,
++                                    global_step=self.global_steps,
++                                )
+ 
+                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                     if rollout_data_dir:
+@@ -439,17 +1472,26 @@ class EviSDRayTrainer(RayPPOTrainer):
+                             )
+ 
+                     test_start_step = self.config.trainer.get("test_start_step", 0)
+-                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or (self.global_steps >= test_start_step and self.global_steps % self.config.trainer.test_freq == 0)):
++                    if not diagnostic_enabled and self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or (self.global_steps >= test_start_step and self.global_steps % self.config.trainer.test_freq == 0)):
+                         with _timer("testing", timing_raw):
+                             val_metrics: dict = self._validate()
+                             if is_last_step:
+                                 last_val_metrics = val_metrics
+                         metrics.update(val_metrics)
+ 
+-                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
++                    if not diagnostic_enabled and self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                         with _timer("save_checkpoint", timing_raw):
+                             self._save_checkpoint()
+ 
++                    if urcr_components_to_write is not None:
++                        with _timer("urcr_component_write", timing_raw):
++                            component_path = write_turn_component_part(
++                                urcr_components_to_write,
++                                output_dir=urcr_config.audit_output_dir,
++                                global_step=self.global_steps,
++                            )
++                        print(f"[URCR Plan 05] wrote turn components: {component_path}")
++
+                 metrics.update({
+                     "training/global_step": self.global_steps,
+                     "training/epoch": epoch,
+@@ -459,11 +1501,35 @@ class EviSDRayTrainer(RayPPOTrainer):
+                 n_gpus = self.resource_pool_manager.get_n_gpus()
+                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+ 
++                if urcr_config.enabled or capture_update_audit:
++                    step_metrics_path = write_step_metrics(
++                        metrics,
++                        output_dir=urcr_config.audit_output_dir,
++                        global_step=self.global_steps,
++                    )
++                    print(f"[URCR Plan 05] wrote step metrics: {step_metrics_path}")
++                if training_batch_record is not None:
++                    batch_manifest_path = append_training_batch_record(
++                        training_batch_record,
++                        output_dir=urcr_config.audit_output_dir,
++                    )
++                    print(
++                        "[URCR Plan 06] appended scientific batch identity: "
++                        f"{batch_manifest_path}"
++                    )
++
+                 logger.log(data=metrics, step=self.global_steps)
+ 
+                 progress_bar.update(1)
+                 self.global_steps += 1
+                 if is_last_step:
+-                    pprint(f"Final validation metrics: {last_val_metrics}")
++                    if diagnostic_enabled:
++                        summary = consolidate_frozen_turn_parts(
++                            diagnostic_output_dir,
++                            artifact_prefix=diagnostic_artifact_prefix,
++                        )
++                        pprint(f"URCR Plan 02 collection summary: {summary}")
++                    else:
++                        pprint(f"Final validation metrics: {last_val_metrics}")
+                     progress_bar.close()
+                     return
