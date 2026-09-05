@@ -1,6 +1,6 @@
 # URCR Core Review Snapshot
 
-This private repository is a compact, code-level review bundle for the active
+This repository is a compact, code-level review bundle for the active
 URCR implementation. It is intended to let a research collaborator inspect the
 reward, responsibility, routing, and PPO-loss data flow without loading the
 full EviSD/veRL tree or any runtime artifacts.
@@ -48,4 +48,3 @@ portable dependencies of this review bundle.
 The exported files themselves, and the commit that contains them, are the
 authoritative review snapshot. See [`SOURCE_STATE.md`](SOURCE_STATE.md) for the
 local source revision from which it was produced.
-

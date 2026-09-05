@@ -9,6 +9,6 @@
 The pinned EviSD root did not contain a root-level `LICENSE`, `COPYING`, or
 `NOTICE` file when imported locally. This review repository therefore does not
 republish the full upstream tree and grants no license to upstream code. It
-contains URCR-focused source files plus narrow integration patches for private
-research review.
-
+contains URCR-focused source files plus narrow integration patches for research
+review. Public availability of this review bundle does not grant a license to
+the upstream EviSD source.
