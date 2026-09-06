@@ -1,5 +1,5 @@
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index 5b376a6..198d013 100644
+index 5b376a6..aaad65b 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -61,7 +61,6 @@ from verl.utils.device import get_device_name, get_torch_device, is_cuda_availab
@@ -10,7 +10,7 @@ index 5b376a6..198d013 100644
  
  import torch.distributed as dist
  from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-@@ -609,28 +608,51 @@ class ActorRolloutRefWorker(Worker):
+@@ -609,28 +608,58 @@ class ActorRolloutRefWorker(Worker):
          if self._is_offload_optimizer:
              load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
  
@@ -57,6 +57,13 @@ index 5b376a6..198d013 100644
 +                # perform training
 +                with Timer(name="update_policy", logger=None) as timer:
 +                    metrics = self.actor.update_policy(data=data)
++                focus_spec = data.meta_info.get("v3_focus_objective")
++                if focus_spec is not None:
++                    self._v3_last_updated_step = int(focus_spec["teacher_version"])
++                    if focus_spec["measure_energy"]:
++                        if any(not torch.isfinite(p).all() for p in self.actor_module_fsdp.parameters()):
++                            raise FloatingPointError("V3 actor parameters became nonfinite")
++                        metrics["v3_focus/parameter_nonfinite_count"] = 0
 +                delta_time = timer.last
 +                global_num_tokens = data.meta_info["global_token_num"]
 +                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -83,10 +90,73 @@ index 5b376a6..198d013 100644
  
          if self._is_offload_param:
              offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-@@ -712,6 +734,87 @@ class ActorRolloutRefWorker(Worker):
+@@ -712,6 +741,150 @@ class ActorRolloutRefWorker(Worker):
  
          return output
  
++    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
++    def compute_urcr_v3_focus_targets(self, data: DataProto):
++        """Freeze sparse targets on the same pre-update FSDP actor, on every rank."""
++        from verl.trainer.ppo.urcr_v3_focus import object_array
++        from verl.trainer.ppo.urcr_v3_focus_loss import FocusForward
++
++        assert self._is_actor
++        if self.ulysses_sequence_parallel_size != 1:
++            raise ValueError("V3 focus scorer requires Ulysses=1")
++        version = int(data.meta_info["v3_focus_teacher_version"])
++        if version <= getattr(self, "_v3_last_updated_step", 0):
++            raise RuntimeError("Cannot recompute V3 targets after the outer-step update")
++        cfg = data.meta_info["v3_focus_spec"]
++        micro_size = int(cfg["teacher_micro_batch_size"])
++        if len(data) == 0 or len(data) % micro_size:
++            raise ValueError("V3 teacher requests must be globally padded to world * microbatch")
++        if self._is_offload_param:
++            load_fsdp_model_to_gpu(self.actor_module_fsdp)
++        model = self.actor_module_fsdp
++        was_training = model.training
++        try:
++            if any(p.grad is not None for p in model.parameters()):
++                raise RuntimeError("Actor gradients must be empty before V3 teacher scoring")
++            data = data.to(get_torch_device().current_device())
++            model.eval()
++            get_torch_device().reset_peak_memory_stats()
++            payloads = []
++            max_micro_tokens = 0
++            with torch.no_grad(), self.ulysses_sharding_manager:
++                data = self.ulysses_sharding_manager.preprocess_data(data)
++                for micro in data.chunk(len(data) // micro_size):
++                    tensors = micro.batch
++                    max_micro_tokens = max(max_micro_tokens, int(tensors["attention_mask"].sum()))
++                    context = FocusForward(
++                        responses=tensors["responses"],
++                        response_mask=tensors["attention_mask"][:, -tensors["responses"].shape[-1]:],
++                        payloads=list(micro.non_tensor_batch["v3_focus_payload"]),
++                        topk=int(cfg["topk"]), block_size=int(cfg["logit_chunk_size"]), teacher=True,
++                    )
++                    # Even an all-dummy microbatch executes the same FSDP forward.
++                    self.actor._forward_micro_batch(tensors, temperature=1.0, focus_context=context)
++                    payloads.extend(context.outputs)
++                    del context
++                if any(p.grad is not None for p in model.parameters()):
++                    raise RuntimeError("V3 teacher populated actor gradients")
++                output = DataProto.from_dict(
++                    tensors={
++                        "v3_teacher_no_grad": torch.ones(len(data), dtype=torch.bool),
++                        "v3_teacher_peak_memory_gib": torch.full((len(data),), get_torch_device().max_memory_allocated() / 1024**3),
++                        "v3_teacher_max_micro_tokens": torch.full((len(data),), max_micro_tokens, dtype=torch.long),
++                    },
++                    non_tensors={"v3_focus_payload": object_array(payloads)},
++                )
++                output = self.ulysses_sharding_manager.postprocess_data(output).to("cpu")
++        finally:
++            model.train(was_training)
++            if self.world_size > 1 and fsdp_version(model) == 1:
++                for handle in model._all_handles:
++                    handle.reshard(True)
++            if self._is_offload_param:
++                offload_fsdp_model_to_cpu(model)
++        return output
++
 +    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
 +    def compute_urcr_responsibility(self, data: DataProto):
 +        """Score Plan 05 true query-to-think masks on the current old actor."""

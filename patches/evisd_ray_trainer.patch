@@ -1,5 +1,5 @@
 diff --git a/verl/trainer/ppo/evisd_ray_trainer.py b/verl/trainer/ppo/evisd_ray_trainer.py
-index fbf832b..928d181 100644
+index fbf832b..4d58821 100644
 --- a/verl/trainer/ppo/evisd_ray_trainer.py
 +++ b/verl/trainer/ppo/evisd_ray_trainer.py
 @@ -4,6 +4,7 @@ from pprint import pprint
@@ -19,7 +19,7 @@ index fbf832b..928d181 100644
  from verl.trainer.ppo.ray_trainer import (
      RayPPOTrainer,
      _timer,
-@@ -22,11 +23,50 @@ from verl.trainer.ppo.ray_trainer import (
+@@ -22,11 +23,55 @@ from verl.trainer.ppo.ray_trainer import (
  )
  from verl.trainer.ppo.reward import compute_reward, compute_reward_async
  from verl.trainer.ppo.evisd_teacher import (
@@ -69,10 +69,15 @@ index fbf832b..928d181 100644
 +)
 +from verl.trainer.ppo.urcr_sources import build_online_g2_rows, validate_plan05_config
 +from verl.trainer.ppo.urcr_update_audit import canonicalize_update_audit_batch
++from verl.trainer.ppo.urcr_v3_focus import (
++    assert_focus_step_health, attach_focus_targets, make_teacher_requests, prepare_focus_candidates,
++    validate_focus_config, write_focus_views,
++)
++from verl.trainer.ppo.urcr_v3_focus_loss import payload_cache_bytes
  from verl.utils.metric import reduce_metrics
  from verl.utils.torch_functional import masked_mean
  from verl.trainer.ppo.metric_utils import (
-@@ -40,15 +80,54 @@ from verl.trainer.ppo.metric_utils import (
+@@ -40,15 +85,54 @@ from verl.trainer.ppo.metric_utils import (
  from agent_system.multi_turn_rollout import adjust_batch
  
  
@@ -130,7 +135,7 @@ index fbf832b..928d181 100644
          evisd_cfg = self.config.algorithm.get("evisd", {})
          teacher_context = evisd_cfg.get("teacher_context", "evisd")
  
-@@ -83,12 +162,56 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -83,12 +167,56 @@ class EviSDRayTrainer(RayPPOTrainer):
              teacher_info_out=teacher_info_out,
              e5_evidence_map=e5_evidence_map,
          )
@@ -190,7 +195,7 @@ index fbf832b..928d181 100644
          """
          from omegaconf import OmegaConf
          from verl.utils.tracking import Tracking
-@@ -100,8 +223,113 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -100,8 +228,116 @@ class EviSDRayTrainer(RayPPOTrainer):
              config=OmegaConf.to_container(self.config, resolve=True),
          )
  
@@ -209,6 +214,9 @@ index fbf832b..928d181 100644
 +            )
 +
 +        urcr_config = validate_plan05_config(self.config.algorithm.get("urcr", {}))
++        focus_config = validate_focus_config(self.config)
++        focus_enabled = focus_config is not None and focus_config["enabled"]
++        record_output_dir = focus_config["output_dir"] if focus_config else urcr_config.audit_output_dir
 +        answer_agam_config = validate_answer_agam_config(
 +            self.config.algorithm.get("urcr", {}).get("answer_agam", {})
 +        )
@@ -278,10 +286,10 @@ index fbf832b..928d181 100644
 +                    f"schedule=linear_to_zero_at_step_{self.total_training_steps}, "
 +                    "explicit_mixed_gate=False"
 +                )
-+        if urcr_config.enabled or capture_update_audit:
++        if urcr_config.enabled or capture_update_audit or focus_config:
 +            resolved_config_path = write_resolved_config(
 +                OmegaConf.to_container(self.config, resolve=True),
-+                output_dir=urcr_config.audit_output_dir,
++                output_dir=record_output_dir,
 +            )
 +            print(f"[URCR Plan 05] wrote resolved config: {resolved_config_path}")
 +
@@ -304,12 +312,12 @@ index fbf832b..928d181 100644
  
          if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
              val_metrics = self._validate()
-@@ -111,7 +339,12 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -111,7 +347,12 @@ class EviSDRayTrainer(RayPPOTrainer):
              if self.config.trainer.get("val_only", False):
                  return
  
 -        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="EviSD Training")
-+        progress_description = "URCR Training" if urcr_config.enabled else "EviSD Training"
++        progress_description = "URCR V3-A Training" if focus_enabled else "URCR Training" if urcr_config.enabled else "EviSD Training"
 +        progress_bar = tqdm(
 +            total=phase_stop_step,
 +            initial=self.global_steps,
@@ -318,13 +326,13 @@ index fbf832b..928d181 100644
          self.global_steps += 1
          last_val_metrics = None
  
-@@ -119,6 +352,16 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -119,6 +360,16 @@ class EviSDRayTrainer(RayPPOTrainer):
              for batch_dict in self.train_dataloader:
                  metrics = {}
                  timing_raw = {}
 +                urcr_components_to_write = None
 +                training_batch_record = None
-+                if urcr_config.enabled:
++                if urcr_config.enabled or focus_config:
 +                    training_batch_record, batch_metrics = build_training_batch_record(
 +                        batch_dict,
 +                        global_step=self.global_steps,
@@ -335,7 +343,7 @@ index fbf832b..928d181 100644
                  batch: DataProto = DataProto.from_single_dict(batch_dict)
  
                  batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-@@ -139,7 +382,7 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -139,7 +390,7 @@ class EviSDRayTrainer(RayPPOTrainer):
                      non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                  )
  
@@ -344,11 +352,50 @@ index fbf832b..928d181 100644
  
                  with _timer("step", timing_raw):
                      with _timer("gen", timing_raw):
-@@ -153,7 +396,18 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -153,7 +404,62 @@ class EviSDRayTrainer(RayPPOTrainer):
                      del batch
                      batch = gen_batch_output
  
 -                    batch = adjust_batch(self.config, batch)
++                    if focus_enabled:
++                        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
++                        with _timer("focus_pack", timing_raw):
++                            selected, original_trajectories, focus_metrics = prepare_focus_candidates(
++                                batch, self.tokenizer, focus_config, self.global_steps,
++                            )
++                            metrics.update(focus_metrics)
++                            # Selection is frozen; length bucketing changes scoring order only.
++                            selected.sort(key=lambda c: len(c["view"].teacher_prompt_ids) + len(c["response_ids"]))
++                            expected_trajectories = self.config.data.train_batch_size * self.config.env.rollout.n
++                            if original_trajectories != expected_trajectories:
++                                raise ValueError("V3 trajectory budget does not match original rollout batch")
++                            targets = []
++                            if selected:
++                                requests = make_teacher_requests(selected, self.tokenizer, focus_config, self.global_steps)
++                                requests, dummy_count = pad_dataproto_to_divisor(
++                                    requests, self.actor_rollout_wg.world_size * focus_config["teacher_micro_batch_size"],
++                                )
++                                if dummy_count:
++                                    requests.non_tensor_batch["v3_focus_payload"][-dummy_count:] = None
++                        with _timer("focus_teacher", timing_raw):
++                            if selected:
++                                scored = self.actor_rollout_wg.compute_urcr_v3_focus_targets(requests)
++                                metrics["perf/focus_teacher_peak_gpu_memory_gb"] = float(scored.batch["v3_teacher_peak_memory_gib"].max())
++                                metrics["perf/focus_teacher_max_microbatch_tokens"] = int(scored.batch["v3_teacher_max_micro_tokens"].max())
++                                scored = unpad_dataproto(scored, dummy_count)
++                                if not scored.batch["v3_teacher_no_grad"].all():
++                                    raise RuntimeError("V3 teacher violated no-grad contract")
++                                targets = list(scored.non_tensor_batch["v3_focus_payload"])
++                                del requests, scored
++                        metrics.update(attach_focus_targets(
++                            batch, selected, targets, original_trajectories, focus_config, self.global_steps,
++                        ))
++                        metrics["v3_focus/teacher_grad_nonzero_count"] = 0
++                        metrics["perf/focus_teacher_micro_batch_size"] = focus_config["teacher_micro_batch_size"]
++                        metrics["perf/teacher_cache_bytes"] = payload_cache_bytes(targets)
++                        write_focus_views(selected, focus_config, self.global_steps)
++                        del targets, selected
++
 +                    adjustment_rng = None
 +                    if capture_update_audit:
 +                        batch = canonicalize_update_audit_batch(batch)
@@ -357,6 +404,11 @@ index fbf832b..928d181 100644
 +                        )
 +                    unadjusted_batch_size = len(batch)
 +                    batch = adjust_batch(self.config, batch, rng=adjustment_rng)
++                    if focus_enabled:
++                        # Copies retain their original GRPO treatment, but never another focus target.
++                        batch.non_tensor_batch["v3_focus_payload"][unadjusted_batch_size:] = None
++                        metrics["train/original_actor_rows"] = unadjusted_batch_size
++                        metrics["train/adjustment_rows"] = len(batch) - unadjusted_batch_size
 +                    if urcr_config.enabled or capture_update_audit:
 +                        adjustment_copy = np.zeros(len(batch), dtype=bool)
 +                        adjustment_copy[unadjusted_batch_size:] = True
@@ -364,7 +416,7 @@ index fbf832b..928d181 100644
                      batch.batch["response_mask"] = compute_response_mask(batch)
  
                      if self.config.trainer.balance_batch:
-@@ -182,18 +436,166 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -182,18 +488,166 @@ class EviSDRayTrainer(RayPPOTrainer):
                          old_log_prob.batch.pop("entropys")
                          batch = batch.union(old_log_prob)
  
@@ -535,7 +587,7 @@ index fbf832b..928d181 100644
  
                      if self.use_reference_policy:
                          with _timer("ref", timing_raw):
-@@ -254,20 +656,9 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -254,20 +708,9 @@ class EviSDRayTrainer(RayPPOTrainer):
                          student_log_probs = batch.batch["old_log_probs"]
                          teacher_lp = batch.batch["teacher_log_probs"]
  
@@ -558,7 +610,7 @@ index fbf832b..928d181 100644
                              # Apply the bounded beta-scaled teacher-student correction.
                              modulation_result = apply_evisd_advantage_modulation(
                                  advantages=batch.batch["advantages"],
-@@ -277,9 +668,9 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -277,9 +720,9 @@ class EviSDRayTrainer(RayPPOTrainer):
                                  modulation_mask=modulation_mask,
                                  beta=evisd_cfg.get("beta", 1.5),
                                  evisd_lambda=evisd_cfg.get("lambda", 0.2),
@@ -570,7 +622,7 @@ index fbf832b..928d181 100644
                                  (
                                      batch.batch["advantages"],
                                      evisd_metrics,
-@@ -288,13 +679,616 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -288,13 +731,616 @@ class EviSDRayTrainer(RayPPOTrainer):
                              else:
                                  batch.batch["advantages"], evisd_metrics = modulation_result
                              metrics.update(evisd_metrics)
@@ -604,13 +656,7 @@ index fbf832b..928d181 100644
 +                                "advantages_before": outcome_anchor,
 +                            }
 +                            _evisd_anchors = {"outcome": outcome_anchor}
- 
--                        delta_t = (teacher_lp - student_log_probs) * response_mask
--                        metrics["evisd/teacher_student_gap_mean"] = masked_mean(delta_t, response_mask).item()
--                        metrics["evisd/teacher_student_gap_std"] = masked_mean(
--                            delta_t ** 2,
--                            response_mask,
--                        ).sqrt().item()
++
 +                        if urcr_config.enabled:
 +                            if (
 +                                _evisd_intermediates is None
@@ -656,7 +702,13 @@ index fbf832b..928d181 100644
 +                                    source_enabled=urcr_config.source_enabled,
 +                                    support_reward=urcr_config.support_reward,
 +                                )
-+
+ 
+-                        delta_t = (teacher_lp - student_log_probs) * response_mask
+-                        metrics["evisd/teacher_student_gap_mean"] = masked_mean(delta_t, response_mask).item()
+-                        metrics["evisd/teacher_student_gap_std"] = masked_mean(
+-                            delta_t ** 2,
+-                            response_mask,
+-                        ).sqrt().item()
 +                            requires_responsibility = requires_urcr_responsibility(
 +                                urcr_config
 +                            )
@@ -1193,7 +1245,7 @@ index fbf832b..928d181 100644
                          metrics.update(compute_group_reward_separability_metrics(batch=batch))
                          metrics.update(
                              compute_traj_credit_metrics(
-@@ -410,19 +1404,58 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -410,19 +1456,70 @@ class EviSDRayTrainer(RayPPOTrainer):
                              print(f"[EviSD Case Study] Saved {total_saved} samples "
                                    f"({len(selected_groups)} groups, {len(paired_groups[:n_groups])} paired) to {save_path}")
  
@@ -1255,7 +1307,19 @@ index fbf832b..928d181 100644
 +                                actor_output = self.actor_rollout_wg.update_actor(batch)
 +                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
 +                            metrics.update(actor_output_metrics)
-+                            if self.config.trainer.get("checkpoint_rotation", {}).get(
++                            if focus_enabled:
++                                if metrics["v3_focus/consumed_rows"] != metrics["v3_focus/selected_rows"]:
++                                    raise RuntimeError("V3 selected targets were lost or consumed more than once")
++                                if metrics["v3_focus/consumed_tokens"] != metrics["v3_focus/selected_token_count"]:
++                                    raise RuntimeError("V3 response token count changed during actor dispatch")
++                                metrics["v3_focus/zero_target_rank_count"] = (
++                                    metrics.pop("v3_focus/zero_target_rank_fraction") * self.actor_rollout_wg.world_size
++                                )
++                                del batch.non_tensor_batch["v3_focus_payload"]
++                                del batch.meta_info["v3_focus_objective"]
++                            if focus_config:
++                                assert_focus_step_health(metrics, enabled=focus_enabled)
++                            elif self.config.trainer.get("checkpoint_rotation", {}).get(
 +                                "enable", False
 +                            ):
 +                                assert_plan06_training_step_health(
@@ -1265,7 +1329,7 @@ index fbf832b..928d181 100644
  
                      rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                      if rollout_data_dir:
-@@ -439,17 +1472,26 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -439,17 +1536,26 @@ class EviSDRayTrainer(RayPPOTrainer):
                              )
  
                      test_start_step = self.config.trainer.get("test_start_step", 0)
@@ -1294,21 +1358,27 @@ index fbf832b..928d181 100644
                  metrics.update({
                      "training/global_step": self.global_steps,
                      "training/epoch": epoch,
-@@ -459,11 +1501,35 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -459,11 +1565,41 @@ class EviSDRayTrainer(RayPPOTrainer):
                  n_gpus = self.resource_pool_manager.get_n_gpus()
                  metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
  
-+                if urcr_config.enabled or capture_update_audit:
++                if focus_enabled:
++                    metrics.update({
++                        "perf/focus_teacher_seconds": timing_raw["focus_teacher"],
++                        "perf/focus_pack_seconds": timing_raw["focus_pack"],
++                        "perf/actor_seconds": timing_raw["update_actor"],
++                    })
++                if urcr_config.enabled or capture_update_audit or focus_config:
 +                    step_metrics_path = write_step_metrics(
 +                        metrics,
-+                        output_dir=urcr_config.audit_output_dir,
++                        output_dir=record_output_dir,
 +                        global_step=self.global_steps,
 +                    )
 +                    print(f"[URCR Plan 05] wrote step metrics: {step_metrics_path}")
 +                if training_batch_record is not None:
 +                    batch_manifest_path = append_training_batch_record(
 +                        training_batch_record,
-+                        output_dir=urcr_config.audit_output_dir,
++                        output_dir=record_output_dir,
 +                    )
 +                    print(
 +                        "[URCR Plan 06] appended scientific batch identity: "

@@ -1,0 +1,45 @@
+defaults:
+  - plan07_answer_agam_core
+  - _self_
+
+algorithm:
+  urcr:
+    enable: false
+    answer_agam:
+      enable: false
+    source:
+      enable: false
+    audit:
+      capture_update_summary: false
+      capture_update_vectors: false
+      save_turn_components: false
+      output_dir: null
+  urcr_v3_focus:
+    enabled: true
+    version: A1
+    topk: 64
+    temperature: 1.0
+    selection_seed: 20260905
+    max_documents: 2
+    document_tokens: 192
+    note_tokens: 512
+    teacher_prompt_length: 4608
+    teacher_total_length: 5120
+    # 2026-09-06 user instruction: align with upstream scoring microbatch first.
+    teacher_micro_batch_size: ${actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu}
+    logit_chunk_size: 32
+    reduction: rollout_trajectory_budget
+    coefficient_max: 0.10
+    warmup_steps: 30
+    audit_all_minibatches: false
+    norm_audit_steps: [1, 30]
+    view_audit_steps: [1, 30, 100, 200, 300]
+    output_dir: /data0/kongmu/agentic-RL/runtime/urcr_v3_a_visible_focus/formal
+
+trainer:
+  project_name: urcr_v3_a_visible_focus
+  experiment_name: urcr_v3_a_visible_focus_A1_base_300step
+  default_local_dir: /data0/kongmu/agentic-RL/runtime/urcr_v3_a_visible_focus/formal/checkpoints/rolling
+  save_freq: 25
+  checkpoint_rotation:
+    replace_existing_checkpoint_at_first_save: false

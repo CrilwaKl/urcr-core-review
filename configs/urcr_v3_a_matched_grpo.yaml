@@ -1,0 +1,8 @@
+defaults:
+  - urcr_v3_a_visible_focus
+  - _self_
+
+algorithm:
+  urcr_v3_focus:
+    enabled: false
+

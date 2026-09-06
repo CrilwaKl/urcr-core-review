@@ -1,0 +1,40 @@
+diff --git a/verl/trainer/main_evisd.py b/verl/trainer/main_evisd.py
+index 486c8a2..fada68e 100644
+--- a/verl/trainer/main_evisd.py
++++ b/verl/trainer/main_evisd.py
+@@ -32,6 +32,11 @@ class EviSDTaskRunner:
+     def run(self, config):
+         from pprint import pprint
+ 
++        import random
++
++        import numpy as np
++        import torch
++
+         from omegaconf import OmegaConf, open_dict
+ 
+         from verl.utils.fs import copy_to_local
+@@ -39,6 +44,14 @@ class EviSDTaskRunner:
+         pprint(OmegaConf.to_container(config, resolve=True))
+         OmegaConf.resolve(config)
+ 
++        controller_seed = config.trainer.get("seed")
++        if controller_seed is not None:
++            controller_seed = int(controller_seed)
++            random.seed(controller_seed)
++            np.random.seed(controller_seed)
++            torch.manual_seed(controller_seed)
++            print(f"[EviSD] controller RNG seed: {controller_seed}")
++
+         evisd_cfg = config.algorithm.get("evisd", {})
+         with open_dict(config):
+             # EviSD modifies outcome-derived credit rather than adding a distillation loss.
+@@ -149,7 +162,7 @@ class EviSDTaskRunner:
+         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+         train_sampler = create_rl_sampler(config.data, train_dataset)
+ 
+-        print("[EviSD] Enabled: using privileged teacher advantage modulation")
++        print(f"[EviSD] privileged teacher advantage modulation enabled={bool(evisd_cfg.get('enable', False))}")
+         print(f"[EviSD] lambda: {evisd_cfg.get('lambda', 0.2)}")
+         print(f"[EviSD] beta: {evisd_cfg.get('beta', 1.5)}")
+         print(f"[EviSD] teacher_context: {evisd_cfg.get('teacher_context', 'evisd')}")
