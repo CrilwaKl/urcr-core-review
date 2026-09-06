@@ -63,8 +63,8 @@ in [UPSTREAM.md](UPSTREAM.md), not instructions to patch this compact repository
 
 ## Important review boundary
 
-The action-format gate is a high-priority failure candidate, not a demonstrated
-historical root cause. For example, a complete answer-only action is valid for
+The response gate rejects some environment-valid actions; this alone does not
+establish a historical root cause. For example, a complete answer-only action is valid for
 the environment but fails A1's response gate. The gate checks text before the
 action and a lowercase `</think>` substring; it is not a complete validator of
 nonempty think content. Reconstructing a later policy's rejected outputs still
