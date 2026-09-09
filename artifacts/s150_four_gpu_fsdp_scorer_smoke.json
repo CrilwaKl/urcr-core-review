@@ -1,0 +1,76 @@
+{
+  "artifact": "urcr_v4_four_gpu_fsdp_scorer_smoke",
+  "created_at": "2026-09-09T17:25:37+08:00",
+  "item_count": 128,
+  "micro_batch_sizes_per_gpu": [
+    8,
+    16,
+    32
+  ],
+  "model": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf",
+  "pass": true,
+  "repeat_max_abs_difference": 0.0,
+  "repeat_metrics": {
+    "urcr_v4/scorer_allocated_bytes_after_max": 40231160320.0,
+    "urcr_v4/scorer_allocated_bytes_before_max": 39608305664.0,
+    "urcr_v4/scorer_item_count": 128.0,
+    "urcr_v4/scorer_padded_token_count": 16768.0,
+    "urcr_v4/scorer_peak_allocated_bytes_max": 42423032320.0,
+    "urcr_v4/scorer_rpc_count": 1.0,
+    "urcr_v4/scorer_true_token_count": 12229.0,
+    "urcr_v4/scorer_unique_item_count": 128.0
+  },
+  "repeat_micro_batch_size_per_gpu": 32,
+  "runs": {
+    "16": {
+      "score_mean": -5.232625379983801,
+      "score_std": 3.87685689822464,
+      "urcr_v4/scorer_allocated_bytes_after_max": 40231056384.0,
+      "urcr_v4/scorer_allocated_bytes_before_max": 39608201728.0,
+      "urcr_v4/scorer_item_count": 128.0,
+      "urcr_v4/scorer_padded_token_count": 14464.0,
+      "urcr_v4/scorer_peak_allocated_bytes_max": 42423032320.0,
+      "urcr_v4/scorer_rpc_count": 2.0,
+      "urcr_v4/scorer_true_token_count": 12229.0,
+      "urcr_v4/scorer_unique_item_count": 128.0,
+      "vs_smallest_max_abs": 0.6248626708984375,
+      "vs_smallest_mean_abs": 0.18178108480060473,
+      "wall_seconds": 1.7186309471726418
+    },
+    "32": {
+      "score_mean": -5.314548629976343,
+      "score_std": 3.8985101805659714,
+      "urcr_v4/scorer_allocated_bytes_after_max": 40231054848.0,
+      "urcr_v4/scorer_allocated_bytes_before_max": 39608291328.0,
+      "urcr_v4/scorer_item_count": 128.0,
+      "urcr_v4/scorer_padded_token_count": 16768.0,
+      "urcr_v4/scorer_peak_allocated_bytes_max": 42423032320.0,
+      "urcr_v4/scorer_rpc_count": 1.0,
+      "urcr_v4/scorer_true_token_count": 12229.0,
+      "urcr_v4/scorer_unique_item_count": 128.0,
+      "vs_smallest_max_abs": 0.6250295639038086,
+      "vs_smallest_mean_abs": 0.17469345167046413,
+      "wall_seconds": 0.9348086640238762
+    },
+    "8": {
+      "score_mean": -5.315170432208106,
+      "score_std": 3.8976989552248007,
+      "urcr_v4/scorer_allocated_bytes_after_max": 40230991872.0,
+      "urcr_v4/scorer_allocated_bytes_before_max": 39608137216.0,
+      "urcr_v4/scorer_item_count": 128.0,
+      "urcr_v4/scorer_padded_token_count": 13312.0,
+      "urcr_v4/scorer_peak_allocated_bytes_max": 42423032320.0,
+      "urcr_v4/scorer_rpc_count": 4.0,
+      "urcr_v4/scorer_true_token_count": 12229.0,
+      "urcr_v4/scorer_unique_item_count": 128.0,
+      "vs_smallest_max_abs": 0.0,
+      "vs_smallest_mean_abs": 0.0,
+      "wall_seconds": 3.4761029444634914
+    }
+  },
+  "schema_version": 1,
+  "sequence_length_max": 131,
+  "sequence_length_min": 65,
+  "temperature": 1.0,
+  "world_size": 4
+}

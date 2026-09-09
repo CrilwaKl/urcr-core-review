@@ -1,0 +1,66 @@
+{
+  "action_utility_negative_count": 8,
+  "action_utility_positive_count": 4,
+  "action_utility_zero_count": 79,
+  "artifact": "urcr_v4_four_gpu_pipeline_smoke",
+  "boundary_only_action_count": 0,
+  "created_at": "2026-09-09T17:48:02+08:00",
+  "global_step": 1,
+  "local_absolute_coefficient_sum": 4.064947128295898,
+  "local_nonzero_span_count": 27,
+  "metadata_present": false,
+  "model": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf",
+  "no_think_valid_action_count": 0,
+  "original_trajectory_count": 32,
+  "pass": true,
+  "provisional_scales": {
+    "diagnostic_only": true,
+    "responsibility_delta": 0.0,
+    "responsibility_scale": 1.0,
+    "used_for_optimizer_update": false,
+    "utility_delta": 0.0,
+    "utility_scale": 1.0
+  },
+  "responsibility_bundle_count": 8,
+  "responsibility_item_count": 27,
+  "responsibility_scorer": {
+    "urcr_v4/scorer_allocated_bytes_after_max": 40231206912.0,
+    "urcr_v4/scorer_allocated_bytes_before_max": 39608352256.0,
+    "urcr_v4/scorer_item_count": 27.0,
+    "urcr_v4/scorer_padded_token_count": 40880.0,
+    "urcr_v4/scorer_peak_allocated_bytes_max": 48702280704.0,
+    "urcr_v4/scorer_rpc_count": 1.0,
+    "urcr_v4/scorer_true_token_count": 20505.0,
+    "urcr_v4/scorer_unique_item_count": 27.0
+  },
+  "responsibility_zero_reasons": {
+    "diagnostic_anchor_cap": 4
+  },
+  "rollouts_per_question": 8,
+  "schema_version": 1,
+  "search_bundle_count": 13,
+  "search_item_count": 65,
+  "search_scorer": {
+    "urcr_v4/scorer_allocated_bytes_after_max": 40231855104.0,
+    "urcr_v4/scorer_allocated_bytes_before_max": 39609000448.0,
+    "urcr_v4/scorer_item_count": 65.0,
+    "urcr_v4/scorer_padded_token_count": 144568.0,
+    "urcr_v4/scorer_peak_allocated_bytes_max": 48702280704.0,
+    "urcr_v4/scorer_rpc_count": 1.0,
+    "urcr_v4/scorer_true_token_count": 75714.0,
+    "urcr_v4/scorer_unique_item_count": 65.0
+  },
+  "search_zero_reasons": {
+    "contrast_sign_conflict": 1,
+    "diagnostic_anchor_cap": 43,
+    "invalid_observation": 3,
+    "nonzero": 12
+  },
+  "temperature": 1.0,
+  "train_questions": 4,
+  "turn_count": 128,
+  "valid_answer_count": 32,
+  "valid_search_count": 59,
+  "wall_seconds": 4.170665644109249,
+  "world_size": 4
+}

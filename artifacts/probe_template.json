@@ -1,0 +1,21 @@
+{
+  "answer_content_ids_example": [
+    8687
+  ],
+  "answer_target_prefix": "<answer>\n",
+  "answer_target_prefix_ids_example": [
+    27,
+    9217,
+    397
+  ],
+  "assistant_close_and_user_open": "<|im_end|>\n<|im_start|>user\n",
+  "created_at": "2026-09-09T15:13:38+08:00",
+  "empty_observation_slot": "<documents></documents>",
+  "first_target_predictor": "target_position_minus_one",
+  "method_revision": "urcr_v4_unified_typed_r1_final",
+  "score_tokens": "answer_content_only",
+  "tokenizer_json_sha256": "9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa",
+  "tokenizer_path": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf",
+  "user_close_and_assistant_open": "<|im_end|>\n<|im_start|>assistant\n",
+  "version": "urcr_v4_native_neutral_answer_probe_r1"
+}

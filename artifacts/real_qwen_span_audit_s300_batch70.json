@@ -1,0 +1,27 @@
+{
+  "counts": {
+    "answer_boundary_only_action": 26,
+    "answer_boundary_overlap": 199,
+    "answer_pure_local_content_available": 481,
+    "answer_responsibility_target_available": 507,
+    "answer_routable_think": 507,
+    "answer_valid": 507,
+    "search_boundary_overlap": 177,
+    "search_pure_local_content_available": 1079,
+    "search_responsibility_target_available": 1079,
+    "search_routable_think": 1079,
+    "search_valid": 1079,
+    "turns": 1588
+  },
+  "created_at": "2026-09-09T15:46:46+08:00",
+  "pass": true,
+  "policy": {
+    "action_local_update": "pure content tokens only; boundary-crossing tokens remain global-GRPO-only",
+    "responsibility_target": "all sampled action-overlap tokens, including an unavoidable boundary token",
+    "semantic_action_validity": "independent of think routing and boundary overlap",
+    "think_local_update": "preserved for either utility sign when routable; no-think or chunk failure only zeroes think-local"
+  },
+  "source": "/data1/kongmu/model_evaluations/base_grpo_3b/base_grpo_3b_s300_seven_dataset_4gpu_resumable/raw_trajectories/batch_00070.parquet",
+  "source_rows": 512,
+  "tokenizer": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf"
+}

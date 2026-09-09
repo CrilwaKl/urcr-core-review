@@ -378,7 +378,6 @@ trainer:
   resume_mode: disable
   rollout_data_dir: null
   save_freq: 50
-  seed: 0
   stop_after_steps: null
   test_freq: -1
   total_epochs: 30

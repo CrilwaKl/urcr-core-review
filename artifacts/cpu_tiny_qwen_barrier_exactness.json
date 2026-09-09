@@ -1,0 +1,12 @@
+{
+  "backend": "transformers.Qwen2ForCausalLM.cpu.sdpa",
+  "barrier_invariance_pass": true,
+  "masked_mutation_abs_diff": 0.0,
+  "masked_mutation_score": -5.058309555053711,
+  "masked_score": -5.058309555053711,
+  "plain_mutation_abs_diff": 0.019010066986083984,
+  "plain_mutation_score": -5.057544231414795,
+  "plain_score": -5.038534164428711,
+  "plain_sensitivity_pass": true,
+  "seed": 20260908
+}

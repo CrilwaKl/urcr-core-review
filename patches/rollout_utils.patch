@@ -1,0 +1,33 @@
+diff --git a/agent_system/multi_turn_rollout/utils.py b/agent_system/multi_turn_rollout/utils.py
+index 6b4db0a..8cf75cc 100644
+--- a/agent_system/multi_turn_rollout/utils.py
++++ b/agent_system/multi_turn_rollout/utils.py
+@@ -82,7 +82,7 @@ def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 256 *
+     return image
+ 
+ 
+-def adjust_batch(config, data: DataProto, mode="copy", rng=None) -> DataProto:
++def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
+     world_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
+     size_divisor_rollout = config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu * world_size
+     if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+@@ -103,8 +103,7 @@ def adjust_batch(config, data: DataProto, mode="copy", rng=None) -> DataProto:
+     
+     if mode == "delete":
+         # Generate indices to remove, rather than indices to keep
+-        chooser = np.random if rng is None else rng
+-        remove_indices = chooser.choice(bs, remainder, replace=False)
++        remove_indices = np.random.choice(bs, remainder, replace=False)
+         # Sort remove_indices to maintain stability when deleting
+         remove_indices = np.sort(remove_indices)
+         
+@@ -120,8 +119,7 @@ def adjust_batch(config, data: DataProto, mode="copy", rng=None) -> DataProto:
+         del data
+     elif mode == "copy":
+         to_add = size_divisor - remainder
+-        chooser = np.random if rng is None else rng
+-        dup_indices = chooser.choice(bs, to_add, replace=False)
++        dup_indices = np.random.choice(bs, to_add, replace=False)
+         dup_proto = data.select_idxs(dup_indices)
+ 
+         adjusted_batch = DataProto.concat([data, dup_proto])

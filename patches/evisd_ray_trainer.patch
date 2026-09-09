@@ -1,1333 +1,2032 @@
 diff --git a/verl/trainer/ppo/evisd_ray_trainer.py b/verl/trainer/ppo/evisd_ray_trainer.py
-index fbf832b..928d181 100644
+index 928d181..89349d0 100644
 --- a/verl/trainer/ppo/evisd_ray_trainer.py
 +++ b/verl/trainer/ppo/evisd_ray_trainer.py
-@@ -4,6 +4,7 @@ from pprint import pprint
- 
- import json
- import os
-+import time
- 
- import numpy as np
- import ray
-@@ -11,7 +12,7 @@ import torch
- from tqdm import tqdm
- 
- from verl import DataProto
--from verl.trainer.ppo.core_algos import agg_loss
-+from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
- from verl.trainer.ppo.ray_trainer import (
-     RayPPOTrainer,
-     _timer,
-@@ -22,11 +23,50 @@ from verl.trainer.ppo.ray_trainer import (
+@@ -66,7 +66,6 @@ from verl.trainer.ppo.urcr_routing import (
+     build_v2_local_routing,
  )
- from verl.trainer.ppo.reward import compute_reward, compute_reward_async
- from verl.trainer.ppo.evisd_teacher import (
--    build_evisd_action_mask,
-     build_evisd_teacher_batch,
-+    build_evisd_typed_action_masks,
-     load_e5_evidence_map,
- )
--from verl.trainer.ppo.evisd_utils import apply_evisd_advantage_modulation
-+from verl.trainer.ppo.evisd_utils import (
-+    apply_evisd_advantage_modulation,
-+    build_evisd_advantage_anchors,
-+    merge_scoped_teacher_log_probs,
-+)
-+from verl.trainer.ppo.urcr_diagnostics import (
-+    build_frozen_turn_rows,
-+    consolidate_frozen_turn_parts,
-+    write_frozen_turn_batch,
-+)
-+from verl.trainer.ppo.urcr_answer_agam import (
-+    apply_answer_agam,
-+    linear_annealed_answer_lambda,
-+    validate_answer_agam_config,
-+)
-+from verl.trainer.ppo.urcr_metrics import (
-+    append_training_batch_record,
-+    assert_plan06_training_step_health,
-+    assert_selected_profile_advantages,
-+    build_training_batch_record,
-+    enrich_urcr_components,
-+    summarize_urcr_components,
-+    write_resolved_config,
-+    write_step_metrics,
-+    write_turn_component_part,
-+)
-+from verl.trainer.ppo.urcr_responsibility import (
-+    build_response_chunk_tensor,
-+    build_response_span_tensor,
-+    needs_responsibility_score,
-+)
-+from verl.trainer.ppo.urcr_localized import MAX_CHUNKS, prepare_think_support
-+from verl.trainer.ppo.urcr_local_objective import effective_local_alpha
-+from verl.trainer.ppo.urcr_routing import (
-+    apply_urcr_routing,
-+    build_outcome_anchor,
-+    build_v2_local_routing,
-+)
-+from verl.trainer.ppo.urcr_sources import build_online_g2_rows, validate_plan05_config
-+from verl.trainer.ppo.urcr_update_audit import canonicalize_update_audit_batch
+ from verl.trainer.ppo.urcr_sources import build_online_g2_rows, validate_plan05_config
+-from verl.trainer.ppo.urcr_update_audit import canonicalize_update_audit_batch
  from verl.utils.metric import reduce_metrics
  from verl.utils.torch_functional import masked_mean
  from verl.trainer.ppo.metric_utils import (
-@@ -40,15 +80,54 @@ from verl.trainer.ppo.metric_utils import (
- from agent_system.multi_turn_rollout import adjust_batch
- 
- 
-+def resolve_phase_stop_step(
-+    *,
-+    total_training_steps: int,
-+    current_global_step: int,
-+    stop_after_steps: int | None,
-+) -> int:
-+    """Resolve a process boundary without changing the optimizer horizon."""
-+    if stop_after_steps is None:
-+        return int(total_training_steps)
-+    stop_step = int(stop_after_steps)
-+    if not 0 < stop_step <= int(total_training_steps):
-+        raise ValueError(
-+            "trainer.stop_after_steps must be in (0, total_training_steps], got "
-+            f"{stop_step} with total_training_steps={total_training_steps}"
-+        )
-+    if stop_step <= int(current_global_step):
-+        raise ValueError(
-+            "trainer.stop_after_steps must be greater than the resumed global step, got "
-+            f"{stop_step} <= {current_global_step}"
-+        )
-+    return stop_step
-+
-+
-+def requires_urcr_responsibility(urcr_config) -> bool:
-+    """Return whether responsibility affects the selected or requested audit path."""
-+    if urcr_config.uses_v2_fixed_support_reward:
-+        # g2_full still needs the frozen scorer's chunk-level LOO values even
-+        # though its scalar rho is fixed to one.
-+        return bool(
-+            urcr_config.compute_shadow_modes
-+            or urcr_config.method in {"g2_full", "g2_shuffled", "g2_real"}
-+        )
-+    return bool(
-+        urcr_config.compute_shadow_modes
-+        or urcr_config.method in {"g2_shuffled", "g2_real"}
-+    )
-+
-+
+@@ -121,6 +120,1609 @@ def requires_urcr_responsibility(urcr_config) -> bool:
  class EviSDRayTrainer(RayPPOTrainer):
--    """GRPO trainer that replaces broadcast credit with EviSD-modulated credit."""
-+    """GRPO trainer with optional upstream EviSD and the active URCR objective."""
+     """GRPO trainer with optional upstream EviSD and the active URCR objective."""
  
++    def _compute_urcr_v4_scores(
++        self,
++        items,
++        *,
++        micro_batch_size_per_gpu: int,
++        token_budget_per_gpu: int,
++    ) -> tuple[dict[str, float], dict[str, float]]:
++        """Send length-bucketed V4 views through staged four-rank RPCs."""
++        if not items:
++            return {}, {
++                "urcr_v4/scorer_item_count": 0.0,
++                "urcr_v4/scorer_unique_item_count": 0.0,
++                "urcr_v4/scorer_rpc_count": 0.0,
++                "urcr_v4/scorer_true_token_count": 0.0,
++                "urcr_v4/scorer_padded_token_count": 0.0,
++            }
++        if micro_batch_size_per_gpu <= 0 or token_budget_per_gpu <= 0:
++            raise ValueError("URCR-V4 scorer batch limits must be positive")
++
++        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
++        from verl.trainer.ppo.urcr_v4_scorer import (
++            deduplicate_scorer_items,
++            expand_deduplicated_scores,
++            pack_scorer_items,
++            pad_teacher_forced_batch,
++            scorer_cost_summary,
++        )
++
++        deduplicated = deduplicate_scorer_items(items)
++        world_size = int(self.actor_rollout_wg.world_size)
++        staged = pack_scorer_items(
++            deduplicated.unique_items,
++            token_budget=int(token_budget_per_gpu) * world_size,
++            max_items=int(micro_batch_size_per_gpu) * world_size,
++            batch_divisor=world_size,
++        )
++        unique_scores: dict[str, float] = {}
++        allocated_before_max = 0
++        allocated_after_max = 0
++        peak_allocated_max = 0
++        for stage in staged:
++            padded = pad_teacher_forced_batch(
++                stage.items,
++                pad_token_id=int(self.tokenizer.pad_token_id),
++            )
++            score_batch = DataProto.from_dict(
++                tensors={
++                    "urcr_v4_input_ids": padded.input_ids,
++                    "urcr_v4_attention_mask": padded.attention_mask,
++                    "urcr_v4_position_ids": padded.position_ids,
++                    "urcr_v4_target_ids": padded.target_ids,
++                    "urcr_v4_target_mask": padded.target_mask,
++                    "urcr_v4_predictor_positions": padded.predictor_positions,
++                    "urcr_v4_blocked_key_mask": padded.blocked_key_mask,
++                },
++                non_tensors={
++                    "urcr_v4_request_id": list(padded.request_ids),
++                },
++                meta_info={
++                    "temperature": float(
++                        self.config.actor_rollout_ref.rollout.temperature
++                    ),
++                    "urcr_v4_scorer_micro_batch_size": int(
++                        micro_batch_size_per_gpu
++                    ),
++                },
++            )
++            score_batch, padding = pad_dataproto_to_divisor(
++                score_batch,
++                world_size,
++            )
++            scored = self.actor_rollout_wg.compute_urcr_v4_scores(score_batch)
++            scored = unpad_dataproto(scored, pad_size=padding)
++            if not scored.batch["urcr_v4_scorer_no_grad"].all().item():
++                raise RuntimeError("URCR-V4 scorer returned an autograd-attached row")
++            if not scored.batch["urcr_v4_backend_restored"].all().item():
++                raise RuntimeError("URCR-V4 scorer did not restore actor attention")
++            output_ids = [
++                str(value)
++                for value in scored.non_tensor_batch["urcr_v4_request_id"].tolist()
++            ]
++            output_scores = scored.batch[
++                "urcr_v4_mean_target_log_prob"
++            ].tolist()
++            if output_ids != list(padded.request_ids):
++                raise RuntimeError("URCR-V4 scorer changed request order")
++            allocated_before_max = max(
++                allocated_before_max,
++                int(scored.batch["urcr_v4_allocated_bytes_before"].max()),
++            )
++            allocated_after_max = max(
++                allocated_after_max,
++                int(scored.batch["urcr_v4_allocated_bytes_after"].max()),
++            )
++            peak_allocated_max = max(
++                peak_allocated_max,
++                int(scored.batch["urcr_v4_peak_allocated_bytes"].max()),
++            )
++            for request_id, value in zip(output_ids, output_scores):
++                if request_id in unique_scores:
++                    raise RuntimeError("URCR-V4 scorer returned a duplicate request")
++                unique_scores[request_id] = float(value)
++
++        if set(unique_scores) != {
++            item.request_id for item in deduplicated.unique_items
++        }:
++            raise RuntimeError("URCR-V4 scorer result set is incomplete")
++        costs = scorer_cost_summary(deduplicated.unique_items, staged)
++        metrics = {
++            "urcr_v4/scorer_item_count": float(len(items)),
++            "urcr_v4/scorer_unique_item_count": float(
++                len(deduplicated.unique_items)
++            ),
++            "urcr_v4/scorer_rpc_count": float(len(staged)),
++            "urcr_v4/scorer_true_token_count": float(costs["true_token_count"]),
++            "urcr_v4/scorer_padded_token_count": float(
++                costs["padded_token_count"]
++            ),
++            "urcr_v4/scorer_allocated_bytes_before_max": float(
++                allocated_before_max
++            ),
++            "urcr_v4/scorer_allocated_bytes_after_max": float(
++                allocated_after_max
++            ),
++            "urcr_v4/scorer_peak_allocated_bytes_max": float(
++                peak_allocated_max
++            ),
++        }
++        return expand_deduplicated_scores(deduplicated, unique_scores), metrics
++
++    def _select_urcr_v4_gradient_groups(
++        self,
++        batch: DataProto,
++        records,
++        *,
++        group_count: int,
++    ) -> tuple[str, ...]:
++        """Choose fixed mixed-reward groups with nonzero global policy gradient."""
++        import hashlib
++
++        from verl.trainer.ppo.urcr_v4_method import METHOD_REVISION
++
++        response_mask = batch.batch["response_mask"]
++        advantages = batch.batch["advantages"]
++        records_by_group = {}
++        for record in records:
++            if record.is_adjustment_copy:
++                continue
++            records_by_group.setdefault(record.rollout_group_id, []).append(record)
++        eligible = []
++        for group_id, group_records in records_by_group.items():
++            if any(
++                bool(
++                    (
++                        advantages[record.batch_row_index].abs()
++                        * response_mask[record.batch_row_index]
++                    ).any()
++                )
++                for record in group_records
++            ):
++                eligible.append(group_id)
++        if len(eligible) < int(group_count):
++            raise ValueError(
++                "V4 gradient calibration has only "
++                f"{len(eligible)} nonzero-global groups, requires {group_count}"
++            )
++        return tuple(
++            sorted(
++                eligible,
++                key=lambda group_id: hashlib.sha256(
++                    f"{METHOD_REVISION}|gradient-groups|{group_id}".encode()
++                ).digest(),
++            )[: int(group_count)]
++        )
++
++    def _build_urcr_v4_gradient_subbatch(
++        self,
++        batch: DataProto,
++        records,
++        *,
++        group_ids,
++    ) -> tuple[DataProto, dict]:
++        """Pack complete selected trajectories into one real actor minibatch."""
++        from verl.trainer.ppo.urcr_v4_pipeline import (
++            interleaved_gradient_batch_layout,
++        )
++
++        selected_groups = set(map(str, group_ids))
++        selected_records = [
++            record
++            for record in records
++            if not record.is_adjustment_copy
++            and record.rollout_group_id in selected_groups
++        ]
++        selected_indices = sorted(
++            {int(record.batch_row_index) for record in selected_records}
++        )
++        trajectory_ids = sorted(
++            {record.trajectory_id for record in selected_records}
++        )
++        observed_groups = {record.rollout_group_id for record in selected_records}
++        if observed_groups != selected_groups:
++            raise ValueError("V4 gradient subbatch lost a selected question group")
++        expected_trajectories = len(selected_groups) * int(self.config.env.rollout.n)
++        if len(trajectory_ids) != expected_trajectories:
++            raise ValueError("V4 gradient subbatch does not contain complete rollout groups")
++        original_mask = batch.batch["urcr_v4_original_row_mask"].bool()
++        if not all(bool(original_mask[index]) for index in selected_indices):
++            raise ValueError("V4 gradient subbatch selected a non-population row")
++
++        target_rows = int(
++            self.config.actor_rollout_ref.actor.ppo_mini_batch_size
++        )
++        micro_batch_size = int(
++            self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
++        )
++        world_size = int(self.actor_rollout_wg.world_size)
++        if target_rows % (world_size * micro_batch_size):
++            raise ValueError("V4 gradient actor minibatch does not divide across ranks")
++        layout, keep = interleaved_gradient_batch_layout(
++            selected_indices,
++            target_row_count=target_rows,
++            micro_batch_size=micro_batch_size,
++        )
++        output = batch.select_idxs(np.asarray(layout, dtype=np.int64))
++        keep_mask = torch.tensor(
++            keep,
++            dtype=torch.bool,
++            device=output.batch["urcr_v4_original_row_mask"].device,
++        )
++        output.batch["urcr_v4_original_row_mask"] = keep_mask
++        padding = ~keep_mask
++        for key in ("urcr_v4_span_masks", "urcr_v4_span_coefficients"):
++            output.batch[key] = output.batch[key].clone()
++            output.batch[key][padding] = 0
++        output.batch["urcr_v4_span_channels"] = output.batch[
++            "urcr_v4_span_channels"
++        ].clone()
++        output.batch["urcr_v4_span_channels"][padding] = -1
++        spec = dict(output.meta_info["urcr_v4_local_objective"])
++        spec.update(
++            {
++                "total_sampling_row_count": len(selected_indices),
++                "original_trajectory_count": len(trajectory_ids),
++                "gradient_uses_unscaled_local": True,
++            }
++        )
++        output.meta_info["urcr_v4_local_objective"] = spec
++        output.meta_info["multi_turn"] = bool(
++            self.config.actor_rollout_ref.rollout.multi_turn.enable
++        )
++        output.meta_info["temperature"] = float(
++            self.config.actor_rollout_ref.rollout.temperature
++        )
++        return output, {
++            "group_ids": sorted(selected_groups),
++            "group_count": len(selected_groups),
++            "trajectory_count": len(trajectory_ids),
++            "turn_row_count": len(selected_indices),
++            "padded_actor_row_count": target_rows - len(selected_indices),
++            "actor_minibatch_row_count": target_rows,
++            "micro_batch_size_per_gpu": micro_batch_size,
++            "world_size": world_size,
++        }
++
++    def _load_urcr_v4_pooled_method(self, v4_cfg, *, lambda_max: float) -> tuple[dict, dict]:
++        """Load only the pooled empirical scales into the already frozen method."""
++        import hashlib
++        from pathlib import Path
++
++        pooled_path = Path(str(v4_cfg.get("pooled_calibration_artifact")))
++        pooled_bytes = pooled_path.read_bytes()
++        pooled = json.loads(pooled_bytes)
++        if pooled.get("artifact") != "urcr_v4_s150_pooled_calibration":
++            raise ValueError("unexpected URCR-V4 pooled calibration identity")
++        if not pooled.get("pass", False) or int(pooled.get("batch_count", 0)) != 10:
++            raise ValueError("URCR-V4 pooled calibration is incomplete")
++        if bool(pooled.get("resolved_method_frozen", True)):
++            raise ValueError("pooled calibration must remain pre-resolution evidence")
++        search = pooled["pooled"]["search"]["calibration"]
++        responsibility = pooled["pooled"]["responsibility"]["summary"]
++        method = {
++            "search_utility": {
++                "delta": float(search["delta"]),
++                "scale": float(search["scale"]),
++            },
++            "responsibility": {
++                "search": {
++                    "delta": float(responsibility["search_calibration"]["delta"]),
++                    "scale": float(responsibility["search_calibration"]["scale"]),
++                },
++                "answer": {
++                    "delta": float(responsibility["answer_calibration"]["delta"]),
++                    "scale": float(responsibility["answer_calibration"]["scale"]),
++                },
++            },
++            "local_loss": {
++                "lambda_max": float(lambda_max),
++                "warmup_steps": 30,
++            },
++        }
++        identity = {
++            "pooled_calibration_artifact": str(pooled_path.resolve()),
++            "pooled_calibration_sha256": hashlib.sha256(pooled_bytes).hexdigest(),
++            "pooled_calibration_batch_count": int(pooled["batch_count"]),
++            "pooled_calibration_question_count": int(pooled["question_count"]),
++            "pooled_calibration_trajectory_count": int(pooled["trajectory_count"]),
++        }
++        return method, identity
++
++    def _load_urcr_v4_resolved_method(self, v4_cfg) -> tuple[dict, dict]:
++        """Load the immutable post-calibration method used by every train step."""
++        from verl.trainer.ppo.urcr_v4_resolution import load_resolved_method
++
++        method, identity = load_resolved_method(
++            str(v4_cfg.get("resolved_method_artifact")),
++            expected_sha256=str(v4_cfg.get("resolved_method_sha256")),
++        )
++        scorer = identity["scorer"]
++        scorer_cfg = v4_cfg.get("scorer", {})
++        expected = {
++            "micro_batch_size_per_gpu": int(
++                scorer_cfg.get("micro_batch_size_per_gpu", 32)
++            ),
++            "token_budget_per_gpu": int(
++                scorer_cfg.get("token_budget_per_gpu", 262144)
++            ),
++            "max_total_tokens": int(scorer_cfg.get("max_total_tokens", 8192)),
++        }
++        for key, value in expected.items():
++            if int(scorer[key]) != value:
++                raise ValueError(f"URCR-V4 scorer contract changed: {key}")
++        return method, identity
++
++    def _write_urcr_v4_turn_components(
++        self,
++        diagnostics: dict,
++        v4_cfg,
++        method_identity: dict,
++    ) -> str:
++        """Persist compact metadata-free credit rows after the actor update."""
++        from dataclasses import asdict
++        from datetime import datetime
++        import hashlib
++        from pathlib import Path
++        from zoneinfo import ZoneInfo
++
++        from verl.trainer.ppo.urcr_v4_method import (
++            METHOD_REVISION,
++            require_no_online_evidence_metadata,
++        )
++
++        output_dir = Path(str(v4_cfg.get("turn_component_dir")))
++        if not str(v4_cfg.get("run_id") or ""):
++            raise ValueError("URCR-V4 training requires a run_id")
++        full_steps = {int(value) for value in v4_cfg.get("full_component_steps", [])}
++        sample_count = int(v4_cfg.get("sampled_turns_per_step", 8))
++        if sample_count <= 0:
++            raise ValueError("URCR-V4 sampled_turns_per_step must be positive")
++
++        records = [
++            record
++            for record in diagnostics["records"]
++            if not record.is_adjustment_copy
++        ]
++        credit_by_index = {
++            int(row.batch_row_index): row for row in diagnostics["assembly"].rows
++        }
++        full = int(self.global_steps) in full_steps
++        selected = records
++        if not full:
++            selected = sorted(
++                records,
++                key=lambda record: hashlib.sha256(
++                    (
++                        f"{METHOD_REVISION}|turn-log|{v4_cfg.get('run_id')}|"
++                        f"{self.global_steps}|{record.turn_id}"
++                    ).encode()
++                ).digest(),
++            )[:sample_count]
++        responsibility_reasons = diagnostics["responsibility_zero_reasons_by_turn"]
++        rows = []
++        for record in selected:
++            credit = credit_by_index[record.batch_row_index]
++            row = {
++                **asdict(credit),
++                "question_id": record.question_id,
++                "rollout_group_id": record.rollout_group_id,
++                "rollout_index": record.rollout_index,
++                "turn_index": record.turn_index,
++                "data_source": record.data_source,
++                "valid_action": record.valid_action,
++                "observation_consumable": record.observation_consumable,
++                "terminal_binary_em": record.terminal_binary_em,
++                "action_target_positions": list(record.action_target_positions),
++                "action_content_positions": list(record.action_content_positions),
++                "action_boundary_positions": list(record.action_boundary_positions),
++                "think_content_positions": list(record.think_content_positions),
++                "responsibility_zero_reason": responsibility_reasons.get(
++                    record.turn_id
++                ),
++            }
++            require_no_online_evidence_metadata(row)
++            rows.append(row)
++        payload = {
++            "schema_version": 1,
++            "artifact": "urcr_v4_turn_components",
++            "method_revision": METHOD_REVISION,
++            "resolved_method_sha256": method_identity["resolved_method_sha256"],
++            "run_id": str(v4_cfg.get("run_id")),
++            "global_step": int(self.global_steps),
++            "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(
++                timespec="seconds"
++            ),
++            "full_population": full,
++            "original_turn_count": len(records),
++            "saved_turn_count": len(rows),
++            "rows": rows,
++        }
++        require_no_online_evidence_metadata(payload)
++        output_dir.mkdir(parents=True, exist_ok=True)
++        if full:
++            output = output_dir / f"step_{self.global_steps:05d}.json"
++            if output.exists():
++                raise FileExistsError(f"refusing to overwrite V4 components: {output}")
++            temporary = output.with_suffix(output.suffix + ".writing")
++            try:
++                temporary.write_text(
++                    json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
++                    encoding="utf-8",
++                )
++                os.replace(temporary, output)
++            finally:
++                temporary.unlink(missing_ok=True)
++        else:
++            output = output_dir / "turn_samples.jsonl"
++            with output.open("a", encoding="utf-8") as stream:
++                stream.write(
++                    json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
++                )
++                stream.flush()
++                os.fsync(stream.fileno())
++        return str(output)
++
++    def _run_urcr_v4_gradient_calibration(
++        self,
++        batch: DataProto,
++        v4_cfg,
++        *,
++        timing_raw: dict[str, float],
++        base_shadow: bool,
++    ) -> None:
++        """Measure raw local/global actor gradients without an optimizer update."""
++        from datetime import datetime
++        import hashlib
++        from pathlib import Path
++        from zoneinfo import ZoneInfo
++
++        from verl.trainer.ppo.urcr_v4_method import (
++            METHOD_REVISION,
++            apply_base_shadow_gradient_ceiling,
++            calibrate_gradient_scale,
++        )
++
++        output = Path(str(v4_cfg.get("diagnostic_output")))
++        if output.exists():
++            raise FileExistsError(f"refusing to overwrite V4 gradient artifact: {output}")
++
++        s150_gradient_identity = None
++        candidate_lambda = 1.0
++        if base_shadow:
++            s150_path = Path(str(v4_cfg.get("gradient_calibration_artifact")))
++            s150_bytes = s150_path.read_bytes()
++            s150_gradient_identity = json.loads(s150_bytes)
++            if s150_gradient_identity.get("artifact") != (
++                "urcr_v4_s150_gradient_calibration"
++            ) or not s150_gradient_identity.get("pass", False):
++                raise ValueError("S150 gradient calibration is missing or failed")
++            candidate_lambda = float(s150_gradient_identity["lambda_max"])
++        method, pooled_identity = self._load_urcr_v4_pooled_method(
++            v4_cfg,
++            lambda_max=candidate_lambda,
++        )
++
++        requested_group_count = 4 if base_shadow else 8
++        pipeline_metrics, diagnostics = self._prepare_urcr_v4_local_batch(
++            batch,
++            v4_cfg,
++            method,
++            diagnostic_group_count=None if base_shadow else requested_group_count,
++        )
++        records = diagnostics["records"]
++        if base_shadow:
++            selected_groups = self._select_urcr_v4_gradient_groups(
++                batch,
++                records,
++                group_count=requested_group_count,
++            )
++            group_partitions = (selected_groups,)
++        else:
++            selected_groups = diagnostics["selected_group_ids"]
++            if selected_groups is None or len(selected_groups) != 8:
++                raise RuntimeError("S150 gradient calibration did not select eight groups")
++            group_partitions = (selected_groups[:4], selected_groups[4:])
++
++        subbatch_results = []
++        for subbatch_index, group_ids in enumerate(group_partitions, start=1):
++            gradient_batch, subbatch_identity = (
++                self._build_urcr_v4_gradient_subbatch(
++                    batch,
++                    records,
++                    group_ids=group_ids,
++                )
++            )
++            started = time.perf_counter()
++            gradient_output = (
++                self.actor_rollout_wg.compute_urcr_v4_gradient_stats(
++                    gradient_batch
++                )
++            )
++            wall_seconds = time.perf_counter() - started
++            gradient_metrics = reduce_metrics(
++                gradient_output.meta_info["metrics"]
++            )
++            global_norm = float(
++                gradient_metrics["urcr_v4_gradient/global_l2"]
++            )
++            local_norm = float(
++                gradient_metrics["urcr_v4_gradient/local_l2"]
++            )
++            nonfinite = float(
++                gradient_metrics["urcr_v4_gradient/global_nonfinite_count"]
++            ) + float(
++                gradient_metrics["urcr_v4_gradient/local_nonfinite_count"]
++            )
++            if (
++                not np.isfinite(global_norm)
++                or not np.isfinite(local_norm)
++                or global_norm <= 0
++                or local_norm <= 0
++                or nonfinite != 0
++            ):
++                raise RuntimeError(
++                    f"invalid V4 gradient subbatch {subbatch_index}: "
++                    f"global={global_norm}, local={local_norm}, nonfinite={nonfinite}"
++                )
++            subbatch_results.append(
++                {
++                    "subbatch_index": subbatch_index,
++                    **subbatch_identity,
++                    "gradient": gradient_metrics,
++                    "driver_wall_seconds": wall_seconds,
++                }
++            )
++
++        if base_shadow:
++            gradient = subbatch_results[0]["gradient"]
++            final_lambda, full_strength_ratio = (
++                apply_base_shadow_gradient_ceiling(
++                    lambda_max=candidate_lambda,
++                    global_gradient_norm=float(
++                        gradient["urcr_v4_gradient/global_l2"]
++                    ),
++                    local_gradient_norm=float(
++                        gradient["urcr_v4_gradient/local_l2"]
++                    ),
++                )
++            )
++            lambda_0 = None
++            global_over_local = [
++                float(gradient["urcr_v4_gradient/global_over_local"])
++            ]
++        else:
++            frozen = calibrate_gradient_scale(
++                global_gradient_norms=[
++                    float(row["gradient"]["urcr_v4_gradient/global_l2"])
++                    for row in subbatch_results
++                ],
++                local_gradient_norms=[
++                    float(row["gradient"]["urcr_v4_gradient/local_l2"])
++                    for row in subbatch_results
++                ],
++            )
++            lambda_0 = frozen.lambda_0
++            final_lambda = frozen.lambda_max
++            global_over_local = list(frozen.global_over_local)
++            full_strength_ratio = max(
++                final_lambda / value for value in frozen.global_over_local
++            )
++
++        source_model = str(self.config.actor_rollout_ref.model.path)
++        model_manifest = Path(source_model) / "export_manifest.json"
++        model_identity = {
++            "path": source_model,
++            "export_manifest": (
++                str(model_manifest.resolve()) if model_manifest.is_file() else None
++            ),
++            "export_manifest_sha256": (
++                hashlib.sha256(model_manifest.read_bytes()).hexdigest()
++                if model_manifest.is_file()
++                else None
++            ),
++        }
++        result = {
++            "schema_version": 1,
++            "artifact": (
++                "urcr_v4_base_shadow_gradient_calibration"
++                if base_shadow
++                else "urcr_v4_s150_gradient_calibration"
++            ),
++            "method_revision": METHOD_REVISION,
++            "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(
++                timespec="seconds"
++            ),
++            "model": model_identity,
++            **pooled_identity,
++            "gradient_subbatches": subbatch_results,
++            "global_over_local": global_over_local,
++            "lambda_0": lambda_0,
++            "lambda_max_before_base_shadow": (
++                candidate_lambda if base_shadow else final_lambda
++            ),
++            "lambda_max": final_lambda,
++            "full_strength_local_over_global_max": full_strength_ratio,
++            "gradient_objectives": {
++                "global": "unscaled_grpo_policy_loss",
++                "local": "unscaled_sum_of_four_v4_channels",
++                "warmup_applied": False,
++                "optimizer_update_executed": False,
++            },
++            "base_shadow_lowered_lambda": bool(
++                base_shadow and final_lambda < candidate_lambda
++            ),
++            "coverage_metrics": pipeline_metrics,
++            "cost": {
++                "rollout_seconds": float(timing_raw.get("gen", 0.0)),
++                "reward_seconds": float(timing_raw.get("reward", 0.0)),
++                "old_log_prob_seconds": float(
++                    timing_raw.get("old_log_prob", 0.0)
++                ),
++                "optimizer_update_executed": False,
++            },
++            "pass": True,
++            "status": "pass",
++        }
++        if base_shadow and s150_gradient_identity is not None:
++            s150_path = Path(str(v4_cfg.get("gradient_calibration_artifact")))
++            result["s150_gradient_calibration_artifact"] = str(
++                s150_path.resolve()
++            )
++            result["s150_gradient_calibration_sha256"] = hashlib.sha256(
++                s150_path.read_bytes()
++            ).hexdigest()
++        output.parent.mkdir(parents=True, exist_ok=True)
++        temporary = output.with_suffix(output.suffix + ".writing")
++        try:
++            temporary.write_text(
++                json.dumps(result, indent=2, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++            os.replace(temporary, output)
++        finally:
++            temporary.unlink(missing_ok=True)
++        print(
++            json.dumps(
++                {
++                    "artifact": result["artifact"],
++                    "output": str(output),
++                    "global_over_local": global_over_local,
++                    "lambda_0": lambda_0,
++                    "lambda_max": final_lambda,
++                    "full_strength_local_over_global_max": full_strength_ratio,
++                    "optimizer_update_executed": False,
++                    "status": "pass",
++                },
++                indent=2,
++                sort_keys=True,
++            )
++        )
++
++    def _run_urcr_v4_scorer_smoke(self, v4_cfg) -> None:
++        """Exercise the real four-rank actor scorer without rollout or update."""
++        from datetime import datetime
++        from pathlib import Path
++        from zoneinfo import ZoneInfo
++
++        from verl.trainer.ppo.urcr_v4_scorer import build_teacher_forced_item
++
++        scorer_cfg = v4_cfg.get("scorer", {})
++        output = Path(str(v4_cfg.get("diagnostic_output")))
++        if output.exists():
++            raise FileExistsError(f"refusing to overwrite V4 scorer smoke: {output}")
++        sizes = sorted(
++            {
++                int(value)
++                for value in scorer_cfg.get(
++                    "smoke_micro_batch_sizes_per_gpu", [8, 16, 32]
++                )
++            }
++        )
++        if not sizes or sizes[0] <= 0:
++            raise ValueError("V4 scorer smoke microbatch sizes must be positive")
++        if int(self.actor_rollout_wg.world_size) != 4:
++            raise ValueError("V4 scorer smoke requires the approved four-GPU worker")
++        item_count = 4 * max(sizes)
++        max_total_tokens = int(scorer_cfg.get("max_total_tokens", 8192))
++        token_budget_per_gpu = int(
++            scorer_cfg.get("token_budget_per_gpu", 262144)
++        )
++        target_ids = tuple(
++            int(value)
++            for value in self.tokenizer.encode("Paris", add_special_tokens=False)
++        )
++        if not target_ids:
++            raise ValueError("V4 scorer smoke target tokenized to empty")
++        items = []
++        for index in range(item_count):
++            chat = self.tokenizer.apply_chat_template(
++                [
++                    {
++                        "role": "system",
++                        "content": "You are a helpful and harmless assistant.",
++                    },
++                    {
++                        "role": "user",
++                        "content": (
++                            f"Scorer integration case {index}: identify the capital "
++                            "of France from the visible evidence."
++                        ),
++                    },
++                ],
++                tokenize=True,
++                add_generation_prompt=True,
++            )
++            think_open = self.tokenizer.encode(
++                "<think>\n", add_special_tokens=False
++            )
++            think_text = " ".join(
++                [f"Visible evidence item {index} supports Paris."]
++                * (2 + index % 7)
++            )
++            think_ids = self.tokenizer.encode(
++                think_text,
++                add_special_tokens=False,
++            )
++            answer_prefix = self.tokenizer.encode(
++                "\n</think>\n<answer>\n",
++                add_special_tokens=False,
++            )
++            context = (*chat, *think_open, *think_ids, *answer_prefix)
++            think_start = len(chat) + len(think_open)
++            blocked = (
++                tuple(range(think_start, think_start + len(think_ids)))
++                if index % 2
++                else ()
++            )
++            items.append(
++                build_teacher_forced_item(
++                    request_id=f"scorer-smoke:{index}",
++                    view="whole_mask" if blocked else "plain",
++                    actor_snapshot_id="urcr-v4-scorer-smoke",
++                    context_ids=context,
++                    target_prefix_ids=(),
++                    target_content_ids=target_ids,
++                    blocked_key_positions=blocked,
++                    max_total_tokens=max_total_tokens,
++                )
++            )
++
++        runs = {}
++        score_vectors = {}
++        for size in sizes:
++            started = time.perf_counter()
++            scores, score_metrics = self._compute_urcr_v4_scores(
++                items,
++                micro_batch_size_per_gpu=size,
++                token_budget_per_gpu=token_budget_per_gpu,
++            )
++            values = np.asarray(
++                [scores[item.request_id] for item in items], dtype=np.float64
++            )
++            if not np.isfinite(values).all():
++                raise RuntimeError("V4 scorer smoke returned nonfinite scores")
++            score_vectors[size] = values
++            runs[str(size)] = {
++                "wall_seconds": time.perf_counter() - started,
++                "score_mean": float(values.mean()),
++                "score_std": float(values.std()),
++                **score_metrics,
++            }
++
++        repeat_size = max(sizes)
++        repeated_scores, repeated_metrics = self._compute_urcr_v4_scores(
++            items,
++            micro_batch_size_per_gpu=repeat_size,
++            token_budget_per_gpu=token_budget_per_gpu,
++        )
++        repeated = np.asarray(
++            [repeated_scores[item.request_id] for item in items],
++            dtype=np.float64,
++        )
++        repeat_max_abs = float(
++            np.max(np.abs(repeated - score_vectors[repeat_size]))
++        )
++        reference_size = min(sizes)
++        for size in sizes:
++            difference = np.abs(score_vectors[size] - score_vectors[reference_size])
++            runs[str(size)]["vs_smallest_mean_abs"] = float(difference.mean())
++            runs[str(size)]["vs_smallest_max_abs"] = float(difference.max())
++
++        result = {
++            "schema_version": 1,
++            "artifact": "urcr_v4_four_gpu_fsdp_scorer_smoke",
++            "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(
++                timespec="seconds"
++            ),
++            "model": str(self.config.actor_rollout_ref.model.path),
++            "world_size": int(self.actor_rollout_wg.world_size),
++            "temperature": float(
++                self.config.actor_rollout_ref.rollout.temperature
++            ),
++            "item_count": item_count,
++            "sequence_length_min": min(item.sequence_length for item in items),
++            "sequence_length_max": max(item.sequence_length for item in items),
++            "micro_batch_sizes_per_gpu": sizes,
++            "repeat_micro_batch_size_per_gpu": repeat_size,
++            "repeat_max_abs_difference": repeat_max_abs,
++            "repeat_metrics": repeated_metrics,
++            "runs": runs,
++            "pass": repeat_max_abs <= 1e-7,
++        }
++        output.parent.mkdir(parents=True, exist_ok=True)
++        temporary = output.with_suffix(output.suffix + ".writing")
++        try:
++            temporary.write_text(
++                json.dumps(result, indent=2, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++            os.replace(temporary, output)
++        finally:
++            temporary.unlink(missing_ok=True)
++        print(json.dumps(result, indent=2, sort_keys=True))
++        if not result["pass"]:
++            raise RuntimeError("URCR-V4 scorer smoke was not deterministic")
++
++    def _run_urcr_v4_pipeline_smoke_batch(self, batch: DataProto, v4_cfg) -> None:
++        """Run one small metadata-free rollout batch through V4 credit assembly."""
++        from collections import Counter
++        from datetime import datetime
++        from pathlib import Path
++        from zoneinfo import ZoneInfo
++
++        from verl.trainer.ppo.urcr_v4_controller import (
++            action_utilities,
++            build_responsibility_request_plan,
++            build_search_request_plan,
++            resolve_responsibilities,
++            resolve_search_utilities,
++        )
++        from verl.trainer.ppo.urcr_v4_data import build_v4_turn_records
++        from verl.trainer.ppo.urcr_v4_pipeline import (
++            assemble_local_credits,
++            local_credit_tensors,
++        )
++
++        started = time.perf_counter()
++        if "metadata" in batch.non_tensor_batch:
++            raise RuntimeError("URCR-V4 rollout batch retained dataset metadata")
++        scorer_cfg = v4_cfg.get("scorer", {})
++        micro_batch_size = int(
++            scorer_cfg.get("micro_batch_size_per_gpu", 32)
++        )
++        token_budget = int(scorer_cfg.get("token_budget_per_gpu", 262144))
++        max_total_tokens = int(scorer_cfg.get("max_total_tokens", 8192))
++        actor_snapshot_id = f"outer-step-{self.global_steps}-pre-update"
++        records = build_v4_turn_records(
++            batch=batch,
++            tokenizer=self.tokenizer,
++            global_step=self.global_steps,
++            expected_rollouts_per_group=int(self.config.env.rollout.n),
++        )
++        search_plan = build_search_request_plan(
++            records,
++            tokenizer=self.tokenizer,
++            actor_snapshot_id=actor_snapshot_id,
++            max_total_tokens=max_total_tokens,
++            max_anchors=int(v4_cfg.get("pipeline_smoke_search_anchors", 16)),
++        )
++        search_scores, search_score_metrics = self._compute_urcr_v4_scores(
++            search_plan.items,
++            micro_batch_size_per_gpu=micro_batch_size,
++            token_budget_per_gpu=token_budget,
++        )
++        search_utilities = resolve_search_utilities(
++            search_plan,
++            search_scores,
++            records,
++            delta=0.0,
++            scale=1.0,
++        )
++        utilities = action_utilities(records, search_utilities)
++        responsibility_plan = build_responsibility_request_plan(
++            records,
++            utilities,
++            actor_snapshot_id=actor_snapshot_id,
++            max_total_tokens=max_total_tokens,
++            max_search_anchors=int(
++                v4_cfg.get("pipeline_smoke_query_responsibility_anchors", 8)
++            ),
++            max_answer_anchors=int(
++                v4_cfg.get("pipeline_smoke_answer_responsibility_anchors", 8)
++            ),
++        )
++        responsibility_scores, responsibility_score_metrics = (
++            self._compute_urcr_v4_scores(
++                responsibility_plan.items,
++                micro_batch_size_per_gpu=micro_batch_size,
++                token_budget_per_gpu=token_budget,
++            )
++        )
++        responsibilities = resolve_responsibilities(
++            responsibility_plan,
++            responsibility_scores,
++            records,
++            utilities,
++            query_delta=0.0,
++            query_scale=1.0,
++            answer_delta=0.0,
++            answer_scale=1.0,
++            query_chunk_delta=0.0,
++            answer_chunk_delta=0.0,
++        )
++        assembly = assemble_local_credits(
++            records,
++            search_utilities=search_utilities,
++            responsibilities=responsibilities,
++        )
++        local_tensors = local_credit_tensors(
++            assembly,
++            response_mask=batch.batch["response_mask"],
++        )
++        coefficients = local_tensors["urcr_v4_span_coefficients"]
++        utility_values = np.asarray(list(utilities.values()), dtype=np.float64)
++        zero_reasons = Counter(
++            result.zero_reason or "nonzero"
++            for result in search_utilities.values()
++        )
++        output = Path(str(v4_cfg.get("diagnostic_output")))
++        result = {
++            "schema_version": 1,
++            "artifact": "urcr_v4_four_gpu_pipeline_smoke",
++            "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(
++                timespec="seconds"
++            ),
++            "model": str(self.config.actor_rollout_ref.model.path),
++            "global_step": int(self.global_steps),
++            "world_size": int(self.actor_rollout_wg.world_size),
++            "temperature": float(
++                self.config.actor_rollout_ref.rollout.temperature
++            ),
++            "train_questions": int(self.config.data.train_batch_size),
++            "rollouts_per_question": int(self.config.env.rollout.n),
++            "metadata_present": False,
++            "turn_count": len(records),
++            "original_trajectory_count": assembly.original_trajectory_count,
++            "valid_search_count": sum(
++                record.action_type == "search" and record.valid_action
++                for record in records
++                if not record.is_adjustment_copy
++            ),
++            "valid_answer_count": sum(
++                record.action_type == "answer" and record.valid_action
++                for record in records
++                if not record.is_adjustment_copy
++            ),
++            "boundary_only_action_count": sum(
++                record.valid_action
++                and bool(record.action_boundary_positions)
++                and not record.action_content_positions
++                for record in records
++                if not record.is_adjustment_copy
++            ),
++            "no_think_valid_action_count": sum(
++                record.valid_action and not record.think_chunks
++                for record in records
++                if not record.is_adjustment_copy
++            ),
++            "search_bundle_count": len(search_plan.bundles),
++            "search_item_count": len(search_plan.items),
++            "search_zero_reasons": dict(sorted(zero_reasons.items())),
++            "responsibility_bundle_count": len(responsibility_plan.bundles),
++            "responsibility_item_count": len(responsibility_plan.items),
++            "responsibility_zero_reasons": dict(
++                sorted(Counter(responsibility_plan.zero_reasons.values()).items())
++            ),
++            "action_utility_positive_count": int((utility_values > 0).sum()),
++            "action_utility_negative_count": int((utility_values < 0).sum()),
++            "action_utility_zero_count": int((utility_values == 0).sum()),
++            "local_nonzero_span_count": int((coefficients != 0).sum()),
++            "local_absolute_coefficient_sum": float(
++                coefficients.abs().sum().item()
++            ),
++            "search_scorer": search_score_metrics,
++            "responsibility_scorer": responsibility_score_metrics,
++            "provisional_scales": {
++                "diagnostic_only": True,
++                "utility_delta": 0.0,
++                "utility_scale": 1.0,
++                "responsibility_delta": 0.0,
++                "responsibility_scale": 1.0,
++                "used_for_optimizer_update": False,
++            },
++            "wall_seconds": time.perf_counter() - started,
++            "pass": True,
++        }
++        output.parent.mkdir(parents=True, exist_ok=True)
++        temporary = output.with_suffix(output.suffix + ".writing")
++        try:
++            temporary.write_text(
++                json.dumps(result, indent=2, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++            os.replace(temporary, output)
++        finally:
++            temporary.unlink(missing_ok=True)
++        print(json.dumps(result, indent=2, sort_keys=True))
++
++    def _run_urcr_v4_calibration_batch(
++        self,
++        batch: DataProto,
++        v4_cfg,
++        *,
++        timing_raw: dict[str, float],
++        output_path=None,
++        calibration_identity: dict | None = None,
++    ) -> None:
++        """Calibrate V4 scales once from the frozen 128x8 S150 batch."""
++        from collections import Counter
++        from datetime import datetime
++        import hashlib
++        from pathlib import Path
++        from zoneinfo import ZoneInfo
++
++        from verl.trainer.ppo.urcr_v4_calibration import (
++            answer_residual_diagnostics,
++            calibrate_responsibility_scores,
++            calibrate_search_scores,
++        )
++        from verl.trainer.ppo.urcr_v4_controller import (
++            action_utilities,
++            build_calibration_responsibility_request_plan,
++            build_search_request_plan,
++        )
++        from verl.trainer.ppo.urcr_v4_data import build_v4_turn_records
++        from verl.trainer.ppo.urcr_v4_method import METHOD_REVISION
++
++        started = time.perf_counter()
++        if "metadata" in batch.non_tensor_batch:
++            raise RuntimeError("URCR-V4 calibration retained dataset metadata")
++        scorer_cfg = v4_cfg.get("scorer", {})
++        micro_batch_size = int(scorer_cfg.get("micro_batch_size_per_gpu", 32))
++        token_budget = int(scorer_cfg.get("token_budget_per_gpu", 262144))
++        max_total_tokens = int(scorer_cfg.get("max_total_tokens", 8192))
++        output = Path(
++            str(
++                output_path
++                if output_path is not None
++                else v4_cfg.get("diagnostic_output")
++            )
++        )
++        if output.exists():
++            raise FileExistsError(f"refusing to overwrite V4 calibration: {output}")
++
++        numeric_reference_path = Path(
++            str(v4_cfg.get("numeric_reference_artifact"))
++        )
++        if not numeric_reference_path.is_file():
++            raise FileNotFoundError(
++                f"missing V4 numeric reference: {numeric_reference_path}"
++            )
++        numeric_reference_bytes = numeric_reference_path.read_bytes()
++        numeric_reference = json.loads(numeric_reference_bytes)
++        if not numeric_reference.get("pass", False):
++            raise ValueError("V4 numeric reference did not pass")
++        if str(numeric_reference.get("model")) != str(
++            self.config.actor_rollout_ref.model.path
++        ):
++            raise ValueError("V4 numeric reference uses a different model")
++        if int(
++            numeric_reference.get("repeat_micro_batch_size_per_gpu", -1)
++        ) != micro_batch_size:
++            raise ValueError(
++                "V4 numeric reference does not match the configured microbatch"
++            )
++        repeat_difference = float(
++            numeric_reference.get("repeat_max_abs_difference", float("nan"))
++        )
++        if not np.isfinite(repeat_difference) or repeat_difference < 0:
++            raise ValueError("V4 numeric reference has an invalid repeat difference")
++        numeric_differences = [repeat_difference]
++
++        actor_snapshot_id = f"outer-step-{self.global_steps}-pre-update"
++        records = build_v4_turn_records(
++            batch=batch,
++            tokenizer=self.tokenizer,
++            global_step=self.global_steps,
++            expected_rollouts_per_group=int(self.config.env.rollout.n),
++        )
++        original_records = [record for record in records if not record.is_adjustment_copy]
++        original_trajectories = {record.trajectory_id for record in original_records}
++        original_groups = {record.rollout_group_id for record in original_records}
++
++        controller_started = time.perf_counter()
++        search_plan = build_search_request_plan(
++            records,
++            tokenizer=self.tokenizer,
++            actor_snapshot_id=actor_snapshot_id,
++            max_total_tokens=max_total_tokens,
++            max_anchors=int(v4_cfg.get("calibration_search_anchors", 256)),
++        )
++        search_controller_seconds = time.perf_counter() - controller_started
++        scorer_started = time.perf_counter()
++        search_scores, search_score_metrics = self._compute_urcr_v4_scores(
++            search_plan.items,
++            micro_batch_size_per_gpu=micro_batch_size,
++            token_budget_per_gpu=token_budget,
++        )
++        search_scorer_seconds = time.perf_counter() - scorer_started
++        frozen_search = calibrate_search_scores(
++            search_plan,
++            search_scores,
++            records,
++            numeric_absolute_differences=numeric_differences,
++        )
++
++        answer_diagnostics = answer_residual_diagnostics(records)
++        utilities = action_utilities(records, frozen_search.utilities)
++        controller_started = time.perf_counter()
++        responsibility_plan = build_calibration_responsibility_request_plan(
++            records,
++            utilities,
++            actor_snapshot_id=actor_snapshot_id,
++            max_total_tokens=max_total_tokens,
++            max_search_anchors=int(
++                v4_cfg.get("calibration_query_responsibility_anchors", 64)
++            ),
++            max_answer_anchors=int(
++                v4_cfg.get("calibration_answer_responsibility_anchors", 64)
++            ),
++        )
++        responsibility_controller_seconds = (
++            time.perf_counter() - controller_started
++        )
++        scorer_started = time.perf_counter()
++        responsibility_scores, responsibility_score_metrics = (
++            self._compute_urcr_v4_scores(
++                responsibility_plan.items,
++                micro_batch_size_per_gpu=micro_batch_size,
++                token_budget_per_gpu=token_budget,
++            )
++        )
++        responsibility_scorer_seconds = time.perf_counter() - scorer_started
++        frozen_responsibility = calibrate_responsibility_scores(
++            responsibility_plan,
++            responsibility_scores,
++            numeric_absolute_differences={
++                "search": numeric_differences,
++                "answer": numeric_differences,
++            },
++        )
++
++        limitations = []
++        if frozen_search.calibration.limited:
++            limitations.append("search_scale_has_fewer_than_8_active_excesses")
++        if frozen_responsibility.search.limited:
++            limitations.append("search_responsibility_uses_scale_fallback")
++        if frozen_responsibility.answer.limited:
++            limitations.append("answer_responsibility_uses_scale_fallback")
++        if (
++            answer_diagnostics["summary"]["nonzero_residual_group_count"] == 0
++        ):
++            limitations.append("answer_residual_has_no_nonzero_group")
++        dependency_effect_count = sum(
++            abs(float(row["whole_dependency"])) > 1e-7
++            for row in frozen_responsibility.rows
++        )
++        structural_pass = bool(
++            frozen_search.rows
++            and frozen_responsibility.rows
++            and dependency_effect_count > 0
++            and answer_diagnostics["summary"][
++                "maximum_absolute_group_residual_sum"
++            ]
++            <= 1e-6
++        )
++        status = (
++            "pass_with_limitation"
++            if structural_pass and limitations
++            else "pass"
++            if structural_pass
++            else "failed"
++        )
++        result = {
++            "schema_version": 2,
++            "artifact": "urcr_v4_s150_frozen_calibration",
++            "method_revision": METHOD_REVISION,
++            "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(
++                timespec="seconds"
++            ),
++            "model": str(self.config.actor_rollout_ref.model.path),
++            "world_size": int(self.actor_rollout_wg.world_size),
++            "temperature": float(
++                self.config.actor_rollout_ref.rollout.temperature
++            ),
++            "scorer_micro_batch_size_per_gpu": micro_batch_size,
++            "scorer_token_budget_per_gpu": token_budget,
++            "metadata_present": False,
++            "question_group_count": len(original_groups),
++            "question_ids": sorted(
++                {record.question_id for record in original_records}
++            ),
++            "original_trajectory_count": len(original_trajectories),
++            "turn_count": len(original_records),
++            "data_source_turn_counts": dict(
++                sorted(Counter(record.data_source for record in original_records).items())
++            ),
++            "numeric_reference": {
++                "path": str(numeric_reference_path),
++                "sha256": hashlib.sha256(numeric_reference_bytes).hexdigest(),
++                "same_shape_repeat_max_abs_difference": repeat_difference,
++                "different_batch_shape_is_diagnostic_only": True,
++            },
++            "search": {
++                "summary": frozen_search.summary,
++                "scorer": search_score_metrics,
++                "rows": list(frozen_search.rows),
++            },
++            "answer": answer_diagnostics,
++            "responsibility": {
++                "summary": frozen_responsibility.summary,
++                "scorer": responsibility_score_metrics,
++                "rows": list(frozen_responsibility.rows),
++                "full_score_used_for_calibration": "old_policy_log_probs",
++                "plain_scorer_role": "backend_alignment_diagnostic",
++                "backend_alignment_error_used_for_delta": True,
++            },
++            "raw_scorer_scores": {
++                "search": search_scores,
++                "responsibility": responsibility_scores,
++            },
++            "cost": {
++                "rollout_seconds": float(timing_raw.get("gen", 0.0)),
++                "reward_seconds": float(timing_raw.get("reward", 0.0)),
++                "old_log_prob_seconds": float(
++                    timing_raw.get("old_log_prob", 0.0)
++                ),
++                "search_controller_seconds": search_controller_seconds,
++                "search_scorer_seconds": search_scorer_seconds,
++                "responsibility_controller_seconds": (
++                    responsibility_controller_seconds
++                ),
++                "responsibility_scorer_seconds": responsibility_scorer_seconds,
++                "calibration_total_seconds": time.perf_counter() - started,
++                "optimizer_update_executed": False,
++            },
++            "limitations": limitations,
++            "status": status,
++            "pass": structural_pass,
++        }
++        if calibration_identity is not None:
++            result.update(calibration_identity)
++        result["responsibility_finalized_at"] = datetime.now(
++            ZoneInfo("Asia/Shanghai")
++        ).isoformat(timespec="seconds")
++        output.parent.mkdir(parents=True, exist_ok=True)
++        temporary = output.with_suffix(output.suffix + ".writing")
++        try:
++            temporary.write_text(
++                json.dumps(result, indent=2, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++            os.replace(temporary, output)
++        finally:
++            temporary.unlink(missing_ok=True)
++        print(json.dumps({key: value for key, value in result.items() if key not in {"raw_scorer_scores", "search", "answer", "responsibility"}}, indent=2, sort_keys=True))
++        print(json.dumps({"search": frozen_search.summary, "answer": answer_diagnostics["summary"], "responsibility": frozen_responsibility.summary}, indent=2, sort_keys=True))
++        if not structural_pass:
++            raise RuntimeError("URCR-V4 calibration failed a structural invariant")
++
++    def _prepare_urcr_v4_local_batch(
++        self,
++        batch: DataProto,
++        v4_cfg,
++        method: dict,
++        *,
++        diagnostic_group_count: int | None = None,
++    ) -> tuple[dict[str, float], dict]:
++        """Build frozen per-turn V4 coefficients before the first actor update."""
++        from collections import Counter
++
++        from verl.trainer.ppo.urcr_v4_controller import (
++            action_utilities,
++            build_responsibility_request_plan,
++            build_search_request_plan,
++            resolve_responsibilities,
++            resolve_search_utilities,
++        )
++        from verl.trainer.ppo.urcr_v4_data import build_v4_turn_records
++        from verl.trainer.ppo.urcr_v4_local_objective import effective_v4_lambda
++        from verl.trainer.ppo.urcr_v4_pipeline import (
++            assemble_local_credits,
++            local_credit_tensors,
++        )
++
++        if "metadata" in batch.non_tensor_batch:
++            raise RuntimeError("URCR-V4 online batch retained dataset metadata")
++        scorer_cfg = v4_cfg.get("scorer", {})
++        micro_batch_size = int(scorer_cfg.get("micro_batch_size_per_gpu", 32))
++        token_budget = int(scorer_cfg.get("token_budget_per_gpu", 262144))
++        max_total_tokens = int(scorer_cfg.get("max_total_tokens", 8192))
++        search_cfg = method["search_utility"]
++        responsibility_cfg = method["responsibility"]
++        local_cfg = method["local_loss"]
++        actor_snapshot_id = f"outer-step-{self.global_steps}-pre-update"
++
++        started = time.perf_counter()
++        records = build_v4_turn_records(
++            batch=batch,
++            tokenizer=self.tokenizer,
++            global_step=self.global_steps,
++            expected_rollouts_per_group=int(self.config.env.rollout.n),
++        )
++        original_records = [record for record in records if not record.is_adjustment_copy]
++        active_trajectory_ids = None
++        anchor_turn_ids = None
++        selected_group_ids = None
++        if diagnostic_group_count is not None:
++            selected_group_ids = self._select_urcr_v4_gradient_groups(
++                batch,
++                original_records,
++                group_count=int(diagnostic_group_count),
++            )
++            selected_group_set = set(selected_group_ids)
++            active_trajectory_ids = {
++                record.trajectory_id
++                for record in original_records
++                if record.rollout_group_id in selected_group_set
++            }
++            anchor_turn_ids = {
++                record.turn_id
++                for record in original_records
++                if record.trajectory_id in active_trajectory_ids
++            }
++        controller_started = time.perf_counter()
++        search_plan = build_search_request_plan(
++            records,
++            tokenizer=self.tokenizer,
++            actor_snapshot_id=actor_snapshot_id,
++            max_total_tokens=max_total_tokens,
++            anchor_turn_ids=anchor_turn_ids,
++        )
++        search_controller_seconds = time.perf_counter() - controller_started
++        scorer_started = time.perf_counter()
++        search_scores, search_score_metrics = self._compute_urcr_v4_scores(
++            search_plan.items,
++            micro_batch_size_per_gpu=micro_batch_size,
++            token_budget_per_gpu=token_budget,
++        )
++        search_scorer_seconds = time.perf_counter() - scorer_started
++        search_utilities = resolve_search_utilities(
++            search_plan,
++            search_scores,
++            records,
++            delta=float(search_cfg["delta"]),
++            scale=float(search_cfg["scale"]),
++        )
++        utilities = action_utilities(records, search_utilities)
++        if active_trajectory_ids is not None:
++            for record in original_records:
++                if record.trajectory_id not in active_trajectory_ids:
++                    utilities[record.turn_id] = 0.0
++
++        controller_started = time.perf_counter()
++        responsibility_plan = build_responsibility_request_plan(
++            records,
++            utilities,
++            actor_snapshot_id=actor_snapshot_id,
++            max_total_tokens=max_total_tokens,
++        )
++        responsibility_controller_seconds = (
++            time.perf_counter() - controller_started
++        )
++        scorer_started = time.perf_counter()
++        responsibility_scores, responsibility_score_metrics = (
++            self._compute_urcr_v4_scores(
++                responsibility_plan.items,
++                micro_batch_size_per_gpu=micro_batch_size,
++                token_budget_per_gpu=token_budget,
++            )
++        )
++        responsibility_scorer_seconds = time.perf_counter() - scorer_started
++        responsibilities = resolve_responsibilities(
++            responsibility_plan,
++            responsibility_scores,
++            records,
++            utilities,
++            query_delta=float(responsibility_cfg["search"]["delta"]),
++            query_scale=float(responsibility_cfg["search"]["scale"]),
++            answer_delta=float(responsibility_cfg["answer"]["delta"]),
++            answer_scale=float(responsibility_cfg["answer"]["scale"]),
++            query_chunk_delta=float(responsibility_cfg["search"]["delta"]),
++            answer_chunk_delta=float(responsibility_cfg["answer"]["delta"]),
++        )
++        assembly = assemble_local_credits(
++            records,
++            search_utilities=search_utilities,
++            responsibilities=responsibilities,
++            active_trajectory_ids=active_trajectory_ids,
++        )
++        tensors = local_credit_tensors(
++            assembly,
++            response_mask=batch.batch["response_mask"],
++        )
++        for key, value in tensors.items():
++            batch.batch[key] = value.detach()
++        original_row_count = int(
++            tensors["urcr_v4_original_row_mask"].sum().item()
++        )
++        lambda_effective = effective_v4_lambda(
++            lambda_max=float(local_cfg["lambda_max"]),
++            global_step=self.global_steps,
++            warmup_steps=int(local_cfg.get("warmup_steps", 30)),
++        )
++        batch.meta_info["urcr_v4_local_objective"] = {
++            "lambda_effective": lambda_effective,
++            "lambda_max": float(local_cfg["lambda_max"]),
++            "warmup_steps": int(local_cfg.get("warmup_steps", 30)),
++            "total_sampling_row_count": original_row_count,
++            "original_trajectory_count": assembly.original_trajectory_count,
++        }
++
++        utility_values = np.asarray(list(utilities.values()), dtype=np.float64)
++        search_utility_values = np.asarray(
++            [value.utility for value in search_utilities.values()],
++            dtype=np.float64,
++        )
++        rho_values = np.asarray(
++            [value.rho for value in responsibilities.values()],
++            dtype=np.float64,
++        )
++        record_by_turn = {record.turn_id: record for record in records}
++        search_rho_values = np.asarray(
++            [
++                value.rho
++                for turn_id, value in responsibilities.items()
++                if record_by_turn[turn_id].action_type == "search"
++            ],
++            dtype=np.float64,
++        )
++        answer_rho_values = np.asarray(
++            [
++                value.rho
++                for turn_id, value in responsibilities.items()
++                if record_by_turn[turn_id].action_type == "answer"
++            ],
++            dtype=np.float64,
++        )
++        responsibility_zero_reasons = Counter(
++            responsibility_plan.zero_reasons.values()
++        )
++        coefficients = tensors["urcr_v4_span_coefficients"]
++        channels = tensors["urcr_v4_span_channels"]
++        metrics = {
++            "urcr_v4/original_turn_row_count": float(original_row_count),
++            "urcr_v4/original_trajectory_count": float(
++                assembly.original_trajectory_count
++            ),
++            "urcr_v4/selected_question_group_count": float(
++                len(selected_group_ids) if selected_group_ids is not None else 0
++            ),
++            "urcr_v4/search_bundle_count": float(len(search_plan.bundles)),
++            "urcr_v4/search_item_count": float(len(search_plan.items)),
++            "urcr_v4/search_utility_positive_count": float(
++                (search_utility_values > 0).sum()
++            ),
++            "urcr_v4/search_utility_negative_count": float(
++                (search_utility_values < 0).sum()
++            ),
++            "urcr_v4/action_utility_positive_count": float(
++                (utility_values > 0).sum()
++            ),
++            "urcr_v4/action_utility_negative_count": float(
++                (utility_values < 0).sum()
++            ),
++            "urcr_v4/action_utility_zero_count": float(
++                (utility_values == 0).sum()
++            ),
++            "urcr_v4/responsibility_bundle_count": float(
++                len(responsibility_plan.bundles)
++            ),
++            "urcr_v4/responsibility_item_count": float(
++                len(responsibility_plan.items)
++            ),
++            "urcr_v4/responsibility_positive_count": float(
++                (rho_values > 0).sum()
++            ),
++            "urcr_v4/search_responsibility_positive_count": float(
++                (search_rho_values > 0).sum()
++            ),
++            "urcr_v4/answer_responsibility_positive_count": float(
++                (answer_rho_values > 0).sum()
++            ),
++            "urcr_v4/responsibility_zero_reason_count": float(
++                len(responsibility_plan.zero_reasons)
++            ),
++            "urcr_v4/local_nonzero_span_count": float(
++                (coefficients != 0).sum().item()
++            ),
++            "urcr_v4/local_absolute_coefficient_sum": float(
++                coefficients.abs().sum().item()
++            ),
++            "urcr_v4/trajectory_cap_active_count": float(
++                sum(
++                    value
++                    < assembly.search_raw_absolute_mass_by_trajectory.get(
++                        trajectory_id, value
++                    )
++                    for trajectory_id, value in (
++                        assembly.search_capped_absolute_mass_by_trajectory.items()
++                    )
++                )
++            ),
++            "urcr_v4/boundary_only_action_count": float(
++                sum(
++                    record.valid_action
++                    and bool(record.action_boundary_positions)
++                    and not record.action_content_positions
++                    for record in records
++                    if not record.is_adjustment_copy
++                )
++            ),
++            "urcr_v4/no_think_valid_action_count": float(
++                sum(
++                    record.valid_action and not record.think_chunks
++                    for record in records
++                    if not record.is_adjustment_copy
++                )
++            ),
++            "urcr_v4/search_zero_reason_count": float(
++                sum(value.utility == 0.0 for value in search_utilities.values())
++            ),
++            "urcr_v4/lambda_effective": lambda_effective,
++            "urcr_v4/search_controller_seconds": search_controller_seconds,
++            "urcr_v4/search_scorer_seconds": search_scorer_seconds,
++            "urcr_v4/responsibility_controller_seconds": (
++                responsibility_controller_seconds
++            ),
++            "urcr_v4/responsibility_scorer_seconds": (
++                responsibility_scorer_seconds
++            ),
++            "urcr_v4/pipeline_seconds": time.perf_counter() - started,
++        }
++        for reason, count in sorted(responsibility_zero_reasons.items()):
++            metrics[f"urcr_v4/responsibility_zero_reason/{reason}"] = float(count)
++        for key, value in search_score_metrics.items():
++            metrics[key.replace("urcr_v4/scorer_", "urcr_v4/search_scorer_")] = value
++        for key, value in responsibility_score_metrics.items():
++            metrics[
++                key.replace("urcr_v4/scorer_", "urcr_v4/responsibility_scorer_")
++            ] = value
++        channel_names = {
++            0: "search_action",
++            1: "search_think",
++            2: "answer_action",
++            3: "answer_think",
++        }
++        for channel_id, channel_name in channel_names.items():
++            selected = channels == channel_id
++            metrics[f"urcr_v4/{channel_name}_span_count"] = float(
++                (selected & (coefficients != 0)).sum().item()
++            )
++            metrics[f"urcr_v4/{channel_name}_absolute_mass"] = float(
++                coefficients.masked_select(selected).abs().sum().item()
++            )
++        diagnostics = {
++            "records": records,
++            "search_utilities": search_utilities,
++            "responsibilities": responsibilities,
++            "assembly": assembly,
++            "selected_group_ids": selected_group_ids,
++            "search_zero_reasons": dict(
++                Counter(
++                    value.zero_reason or "nonzero"
++                    for value in search_utilities.values()
++                )
++            ),
++            "responsibility_zero_reasons": dict(responsibility_zero_reasons),
++            "responsibility_zero_reasons_by_turn": dict(
++                responsibility_plan.zero_reasons
++            ),
++        }
++        return metrics, diagnostics
++
      def _compute_teacher_log_probs(
          self,
          batch: DataProto,
-         teacher_info_out: list | None = None,
--    ) -> torch.Tensor:
--        """Re-score the sampled response under its action-aligned privileged context."""
-+        score_row_mask: torch.Tensor | None = None,
-+    ) -> tuple[torch.Tensor, int]:
-+        """Re-score only rows whose privileged correction can reach the main loss."""
-         evisd_cfg = self.config.algorithm.get("evisd", {})
-         teacher_context = evisd_cfg.get("teacher_context", "evisd")
+@@ -237,12 +1839,170 @@ class EviSDRayTrainer(RayPPOTrainer):
+                 "rollout and scoring will run, optimizer updates are disabled"
+             )
  
-@@ -83,12 +162,56 @@ class EviSDRayTrainer(RayPPOTrainer):
-             teacher_info_out=teacher_info_out,
-             e5_evidence_map=e5_evidence_map,
++        v4_cfg = self.config.algorithm.get("urcr_v4", {})
++        v4_enabled = bool(v4_cfg.get("enable", False))
++        v4_mode = str(v4_cfg.get("mode", "train"))
++        if v4_enabled and v4_mode not in {
++            "scorer_smoke",
++            "pipeline_smoke",
++            "calibration",
++            "calibration_population",
++            "gradient_calibration",
++            "base_shadow",
++            "train",
++        }:
++            raise ValueError(f"unsupported URCR-V4 mode: {v4_mode}")
++
+         urcr_config = validate_plan05_config(self.config.algorithm.get("urcr", {}))
+         answer_agam_config = validate_answer_agam_config(
+             self.config.algorithm.get("urcr", {}).get("answer_agam", {})
          )
--        teacher_output = self.actor_rollout_wg.compute_log_prob(teacher_batch)
--        return teacher_output.batch["old_log_probs"]
-+        if score_row_mask is None:
-+            scored_row_indices = torch.arange(len(batch), dtype=torch.long)
-+        else:
-+            if score_row_mask.ndim != 1 or len(score_row_mask) != len(batch):
-+                raise ValueError(
-+                    "EviSD teacher score-row mask must have one value per actor row"
-+                )
-+            scored_row_indices = torch.nonzero(
-+                score_row_mask.detach().cpu().bool(),
-+                as_tuple=False,
-+            ).flatten()
-+
-+        scored_flags = torch.zeros(len(batch), dtype=torch.bool)
-+        scored_flags[scored_row_indices] = True
-+        if teacher_info_out is not None:
-+            if len(teacher_info_out) != len(batch):
-+                raise RuntimeError("EviSD teacher metadata count does not match actor rows")
-+            for index, info in enumerate(teacher_info_out):
-+                info["teacher_scored"] = bool(scored_flags[index])
-+
-+        student_log_probs = batch.batch["old_log_probs"]
-+        if not len(scored_row_indices):
-+            return student_log_probs.detach().clone(), 0
-+        if len(scored_row_indices) == len(batch):
-+            teacher_output = self.actor_rollout_wg.compute_log_prob(teacher_batch)
-+            return teacher_output.batch["old_log_probs"], len(batch)
-+
-+        scoped_teacher_batch = teacher_batch.select_idxs(
-+            scored_row_indices.numpy()
-+        )
-+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-+
-+        scoped_teacher_batch, padding_size = pad_dataproto_to_divisor(
-+            scoped_teacher_batch,
-+            self.actor_rollout_wg.world_size,
-+        )
-+        teacher_output = self.actor_rollout_wg.compute_log_prob(
-+            scoped_teacher_batch
-+        )
-+        teacher_output = unpad_dataproto(teacher_output, padding_size)
-+        teacher_log_probs = merge_scoped_teacher_log_probs(
-+            student_log_probs,
-+            teacher_output.batch["old_log_probs"],
-+            scored_row_indices,
-+        )
-+        return teacher_log_probs, len(scored_row_indices)
- 
-     def fit(self):
-         """
--        Train with the original GRPO advantages modulated by EviSD.
-+        Train with the selected outcome-anchored EviSD or URCR objective.
-         """
-         from omegaconf import OmegaConf
-         from verl.utils.tracking import Tracking
-@@ -100,8 +223,113 @@ class EviSDRayTrainer(RayPPOTrainer):
-             config=OmegaConf.to_container(self.config, resolve=True),
-         )
- 
-+        diagnostic_cfg = self.config.algorithm.get("urcr_diagnostics", {})
-+        diagnostic_enabled = bool(diagnostic_cfg.get("enable", False))
-+        diagnostic_output_dir = diagnostic_cfg.get("output_dir")
-+        diagnostic_artifact_prefix = str(diagnostic_cfg.get("output_prefix", ""))
-+        if diagnostic_enabled:
-+            if not self.config.algorithm.evisd.get("enable", False):
-+                raise ValueError("URCR diagnostics require algorithm.evisd.enable=True")
-+            if not diagnostic_output_dir:
-+                raise ValueError("URCR diagnostics require algorithm.urcr_diagnostics.output_dir")
-+            print(
-+                "[URCR Plan 02] diagnostic-only mode enabled: "
-+                "rollout and scoring will run, optimizer updates are disabled"
-+            )
-+
-+        urcr_config = validate_plan05_config(self.config.algorithm.get("urcr", {}))
-+        answer_agam_config = validate_answer_agam_config(
-+            self.config.algorithm.get("urcr", {}).get("answer_agam", {})
-+        )
-+        if answer_agam_config.enabled and not urcr_config.enabled:
-+            raise ValueError("AGAM-Core requires the active URCR training path")
-+        capture_update_audit = (
-+            urcr_config.capture_update_summary or urcr_config.capture_update_vectors
-+        )
-+        if urcr_config.enabled:
-+            if diagnostic_enabled and capture_update_audit:
-+                raise ValueError(
-+                    "Plan 05 no-update diagnostics cannot capture optimizer update vectors"
-+                )
+         if answer_agam_config.enabled and not urcr_config.enabled:
+             raise ValueError("AGAM-Core requires the active URCR training path")
++        if v4_enabled:
 +            evisd_cfg = self.config.algorithm.evisd
-+            if bool(evisd_cfg.get("enable", False)):
-+                raise ValueError(
-+                    "Online URCR uses a pure GRPO outcome anchor; "
-+                    "algorithm.evisd.enable must be False"
-+                )
-+            if bool(evisd_cfg.get("answer_enable", False)):
-+                raise ValueError(
-+                    "Online URCR forbids privileged answer PI; "
-+                    "algorithm.evisd.answer_enable must be False"
-+                )
-+            if urcr_config.save_surrogate_coefficients and not urcr_config.compute_shadow_modes:
-+                raise ValueError(
-+                    "Plan05-MIX save_surrogate_coefficients requires compute_shadow_modes=True"
-+                )
-+            if (
-+                urcr_config.uses_v2_fixed_support_reward
-+                and urcr_config.compute_shadow_modes
++            if diagnostic_enabled:
++                raise ValueError("URCR-V4 cannot reuse the legacy EviSD diagnostic path")
++            if urcr_config.enabled or answer_agam_config.enabled:
++                raise ValueError("URCR-V4 requires legacy URCR and AGAM to be disabled")
++            if bool(evisd_cfg.get("enable", False)) or bool(
++                evisd_cfg.get("answer_enable", False)
++            ) or bool(evisd_cfg.get("search_enable_for_main_loss", False)) or bool(
++                evisd_cfg.get("search_shadow_enable", False)
 +            ):
-+                raise ValueError(
-+                    "URCR v2 uses the independent same-forward local objective; "
-+                    "legacy compute_shadow_modes must be False"
-+                )
-+            if urcr_config.save_turn_components and not urcr_config.audit_output_dir:
-+                raise ValueError("Plan 05 save_turn_components requires algorithm.urcr.audit.output_dir")
-+            responsibility_micro_batch = int(
-+                self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-+            )
-+            if responsibility_micro_batch <= 0:
-+                raise ValueError(
-+                    "Online URCR requires a positive base rollout "
-+                    "log_prob_micro_batch_size_per_gpu"
-+                )
-+            print(
-+                "[URCR Plan05-MIX] repaired objective enabled: "
-+                f"method={urcr_config.method}, routing={urcr_config.routing_mode}, "
-+                f"responsibility_micro_batch={responsibility_micro_batch} "
-+                "(inherited from rollout log-prob)"
-+            )
-+            if urcr_config.uses_v2_fixed_support_reward:
-+                print(
-+                    "[URCR v2] fixed local support objective enabled: "
-+                    f"utility={urcr_config.support_reward.utility_mode}, "
-+                    f"b_Q={urcr_config.support_reward.base_query_reward}, "
-+                    f"kappa_doc={urcr_config.support_reward.doc_only_utility}, "
-+                    f"L_ref={urcr_config.local_objective.think_length_ref}, "
-+                    f"local_max={urcr_config.local_objective.local_max}, "
-+                    f"warmup_steps={urcr_config.local_objective.warmup_steps}"
-+                )
-+            if answer_agam_config.enabled:
-+                print(
-+                    "[URCR AGAM-Core] answer-only gold-grounded modulation enabled: "
-+                    f"lambda_start={answer_agam_config.lambda_start}, "
-+                    f"schedule=linear_to_zero_at_step_{self.total_training_steps}, "
-+                    "explicit_mixed_gate=False"
-+                )
-+        if urcr_config.enabled or capture_update_audit:
-+            resolved_config_path = write_resolved_config(
-+                OmegaConf.to_container(self.config, resolve=True),
-+                output_dir=urcr_config.audit_output_dir,
-+            )
-+            print(f"[URCR Plan 05] wrote resolved config: {resolved_config_path}")
++                raise ValueError("URCR-V4 requires all privileged EviSD paths disabled")
++            legacy_urcr_cfg = self.config.algorithm.get("urcr", {})
++            if bool(legacy_urcr_cfg.get("source", {}).get("enable", False)):
++                raise ValueError("URCR-V4 requires the legacy URCR source disabled")
++            if float(self.config.actor_rollout_ref.rollout.temperature) != 1.0:
++                raise ValueError("URCR-V4 requires the approved rollout temperature 1")
++            if v4_mode in {
++                "scorer_smoke",
++                "pipeline_smoke",
++                "calibration",
++                "calibration_population",
++                "gradient_calibration",
++                "base_shadow",
++            }:
++                if not v4_cfg.get("diagnostic_output"):
++                    raise ValueError("V4 validation requires diagnostic_output")
++                if int(self.config.trainer.n_gpus_per_node) != 4:
++                    raise ValueError("V4 validation requires four GPUs")
++            if v4_mode in {"calibration", "calibration_population"}:
++                if int(self.config.data.train_batch_size) != 128:
++                    raise ValueError("V4 calibration requires the frozen 128-question batch")
++                if not v4_cfg.get("numeric_reference_artifact"):
++                    raise ValueError("V4 calibration requires numeric_reference_artifact")
++                if v4_mode == "calibration_population":
++                    if bool(self.config.data.shuffle):
++                        raise ValueError(
++                            "V4 calibration population requires sequential data order"
++                        )
++                    if not v4_cfg.get("calibration_population_manifest"):
++                        raise ValueError(
++                            "V4 calibration population requires its manifest"
++                        )
++            elif v4_mode in {"gradient_calibration", "base_shadow"}:
++                if int(self.config.data.train_batch_size) != 128:
++                    raise ValueError(
++                        "V4 gradient calibration requires one 128-question batch"
++                    )
++                if not v4_cfg.get("pooled_calibration_artifact"):
++                    raise ValueError(
++                        "V4 gradient calibration requires pooled calibration"
++                    )
++                if v4_mode == "base_shadow" and not v4_cfg.get(
++                    "gradient_calibration_artifact"
++                ):
++                    raise ValueError(
++                        "V4 Base shadow requires S150 gradient calibration"
++                    )
++            elif v4_mode == "train":
++                if int(self.config.data.train_batch_size) != 128:
++                    raise ValueError("URCR-V4 training requires global batch 128")
++                if int(self.config.trainer.total_training_steps) != 300:
++                    raise ValueError("URCR-V4 training requires the 300-step horizon")
++                if not v4_cfg.get("resolved_method_artifact") or not v4_cfg.get(
++                    "resolved_method_sha256"
++                ):
++                    raise ValueError("URCR-V4 training requires a frozen method artifact")
++                if not v4_cfg.get("run_id") or not v4_cfg.get("turn_component_dir"):
++                    raise ValueError("URCR-V4 training requires run/component identity")
++        v4_population = None
++        v4_population_entries = None
++        v4_population_manifest_path = None
++        v4_population_manifest_sha256 = None
++        v4_population_start = None
++        v4_population_end = None
++        if v4_enabled and v4_mode == "calibration_population":
++            import hashlib
++            from pathlib import Path
 +
-         self.global_steps = 0
-+        checkpoint_load_started = time.perf_counter()
++            v4_population_manifest_path = Path(
++                str(v4_cfg.get("calibration_population_manifest"))
++            )
++            manifest_bytes = v4_population_manifest_path.read_bytes()
++            v4_population = json.loads(manifest_bytes)
++            if v4_population.get("artifact") != (
++                "urcr_v4_s150_calibration_population"
++            ):
++                raise ValueError("unexpected V4 calibration population manifest")
++            if str(v4_population.get("diagnostic_model")) != str(
++                self.config.actor_rollout_ref.model.path
++            ):
++                raise ValueError("V4 calibration population uses a different model")
++            if float(v4_population.get("temperature", float("nan"))) != 1.0:
++                raise ValueError("V4 calibration population temperature changed")
++            if int(v4_population.get("rollouts_per_question", -1)) != int(
++                self.config.env.rollout.n
++            ):
++                raise ValueError("V4 calibration population rollout count changed")
++            if bool(v4_population.get("optimizer_updates", True)):
++                raise ValueError("V4 calibration population permits optimizer updates")
++            v4_population_start = int(
++                v4_cfg.get("calibration_population_start_batch", 2)
++            )
++            v4_population_end = int(
++                v4_cfg.get("calibration_population_end_batch", 10)
++            )
++            if not 2 <= v4_population_start <= v4_population_end <= int(
++                v4_population["batch_count"]
++            ):
++                raise ValueError("invalid V4 calibration population batch range")
++            v4_population_entries = {
++                int(entry["batch_index"]): entry
++                for entry in v4_population["batches"]
++            }
++            expected_files = [
++                os.path.abspath(str(v4_population_entries[index]["data_path"]))
++                for index in range(v4_population_start, v4_population_end + 1)
++            ]
++            configured_files = self.config.data.train_files
++            if isinstance(configured_files, str):
++                configured_files = [configured_files]
++            configured_files = [
++                os.path.abspath(str(path)) for path in configured_files
++            ]
++            if configured_files != expected_files:
++                raise ValueError(
++                    "V4 calibration population train files do not match manifest order"
++                )
++            v4_population_manifest_sha256 = hashlib.sha256(
++                manifest_bytes
++            ).hexdigest()
++
++        v4_method = None
++        v4_method_identity = None
++        if v4_enabled and v4_mode == "train":
++            v4_method, v4_method_identity = self._load_urcr_v4_resolved_method(
++                v4_cfg
++            )
++            print(
++                "[URCR-V4] loaded frozen method "
++                f"revision={v4_method_identity['method_revision']} "
++                f"sha256={v4_method_identity['resolved_method_sha256']}"
++            )
++
+         capture_update_audit = (
+             urcr_config.capture_update_summary or urcr_config.capture_update_vectors
+         )
+@@ -318,6 +2078,9 @@ class EviSDRayTrainer(RayPPOTrainer):
+         checkpoint_load_started = time.perf_counter()
          self._load_checkpoint()
-+        checkpoint_load_seconds = time.perf_counter() - checkpoint_load_started
-+        if self.config.trainer.get("exit_after_load", False):
-+            print(
-+                "[Plan06 checkpoint load-only] "
-+                f"global_step={self.global_steps}, wall_seconds={checkpoint_load_seconds:.6f}"
-+            )
+         checkpoint_load_seconds = time.perf_counter() - checkpoint_load_started
++        if v4_enabled and v4_mode == "scorer_smoke":
++            self._run_urcr_v4_scorer_smoke(v4_cfg)
 +            return
-+
-+        phase_stop_step = resolve_phase_stop_step(
-+            total_training_steps=self.total_training_steps,
-+            current_global_step=self.global_steps,
-+            stop_after_steps=self.config.trainer.get("stop_after_steps"),
-+        )
- 
-         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-             val_metrics = self._validate()
-@@ -111,7 +339,12 @@ class EviSDRayTrainer(RayPPOTrainer):
+         if self.config.trainer.get("exit_after_load", False):
+             print(
+                 "[Plan06 checkpoint load-only] "
+@@ -339,7 +2102,13 @@ class EviSDRayTrainer(RayPPOTrainer):
              if self.config.trainer.get("val_only", False):
                  return
  
--        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="EviSD Training")
-+        progress_description = "URCR Training" if urcr_config.enabled else "EviSD Training"
-+        progress_bar = tqdm(
-+            total=phase_stop_step,
-+            initial=self.global_steps,
-+            desc=progress_description,
+-        progress_description = "URCR Training" if urcr_config.enabled else "EviSD Training"
++        progress_description = (
++            "URCR-V4 Validation"
++            if v4_enabled
++            else "URCR Training"
++            if urcr_config.enabled
++            else "EviSD Training"
 +        )
-         self.global_steps += 1
-         last_val_metrics = None
- 
-@@ -119,6 +352,16 @@ class EviSDRayTrainer(RayPPOTrainer):
-             for batch_dict in self.train_dataloader:
+         progress_bar = tqdm(
+             total=phase_stop_step,
+             initial=self.global_steps,
+@@ -353,7 +2122,36 @@ class EviSDRayTrainer(RayPPOTrainer):
                  metrics = {}
                  timing_raw = {}
-+                urcr_components_to_write = None
-+                training_batch_record = None
-+                if urcr_config.enabled:
-+                    training_batch_record, batch_metrics = build_training_batch_record(
-+                        batch_dict,
-+                        global_step=self.global_steps,
-+                        epoch=epoch,
-+                        shuffle_seed=int(self.config.data.get("seed", 1)),
+                 urcr_components_to_write = None
++                v4_diagnostics_to_write = None
+                 training_batch_record = None
++                v4_population_batch_index = None
++                v4_population_entry = None
++                if v4_enabled and v4_mode == "calibration_population":
++                    v4_population_batch_index = (
++                        int(v4_population_start) + self.global_steps - 1
 +                    )
-+                    metrics.update(batch_metrics)
-                 batch: DataProto = DataProto.from_single_dict(batch_dict)
- 
-                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-@@ -139,7 +382,7 @@ class EviSDRayTrainer(RayPPOTrainer):
-                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                 )
- 
--                is_last_step = self.global_steps >= self.total_training_steps
-+                is_last_step = self.global_steps >= phase_stop_step
- 
-                 with _timer("step", timing_raw):
-                     with _timer("gen", timing_raw):
-@@ -153,7 +396,18 @@ class EviSDRayTrainer(RayPPOTrainer):
++                    if v4_population_batch_index > int(v4_population_end):
++                        progress_bar.close()
++                        return
++                    v4_population_entry = v4_population_entries[
++                        v4_population_batch_index
++                    ]
++                    observed_questions = {
++                        f"{source}:{extra['split']}:row:{int(extra['index'])}"
++                        for source, extra in zip(
++                            batch_dict["data_source"],
++                            batch_dict["extra_info"],
++                            strict=True,
++                        )
++                    }
++                    expected_questions = set(
++                        map(str, v4_population_entry["question_ids"])
++                    )
++                    if observed_questions != expected_questions:
++                        raise ValueError(
++                            "V4 calibration population dataloader batch identity "
++                            f"mismatch at batch {v4_population_batch_index:02d}"
++                        )
+                 if urcr_config.enabled:
+                     training_batch_record, batch_metrics = build_training_batch_record(
+                         batch_dict,
+@@ -370,7 +2168,10 @@ class EviSDRayTrainer(RayPPOTrainer):
+                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
+                 if "raw_prompt" in batch.non_tensor_batch:
+                     non_tensor_batch_keys_to_pop.append("raw_prompt")
+-                for key in ("reward_model", "metadata", "extra_info"):
++                rollout_context_fields = ["reward_model", "extra_info"]
++                if not v4_enabled:
++                    rollout_context_fields.append("metadata")
++                for key in rollout_context_fields:
+                     if key in batch.non_tensor_batch:
+                         non_tensor_batch_keys_to_pop.append(key)
+                 if "tools_kwargs" in batch.non_tensor_batch:
+@@ -396,15 +2197,9 @@ class EviSDRayTrainer(RayPPOTrainer):
                      del batch
                      batch = gen_batch_output
  
--                    batch = adjust_batch(self.config, batch)
-+                    adjustment_rng = None
-+                    if capture_update_audit:
-+                        batch = canonicalize_update_audit_batch(batch)
-+                        adjustment_rng = np.random.default_rng(
-+                            [int(self.config.data.get("seed", 1)), int(self.global_steps)]
-+                        )
-+                    unadjusted_batch_size = len(batch)
-+                    batch = adjust_batch(self.config, batch, rng=adjustment_rng)
-+                    if urcr_config.enabled or capture_update_audit:
-+                        adjustment_copy = np.zeros(len(batch), dtype=bool)
-+                        adjustment_copy[unadjusted_batch_size:] = True
-+                        batch.non_tensor_batch["urcr_is_adjustment_copy"] = adjustment_copy
-                     batch.batch["response_mask"] = compute_response_mask(batch)
- 
-                     if self.config.trainer.balance_batch:
-@@ -182,18 +436,166 @@ class EviSDRayTrainer(RayPPOTrainer):
+-                    adjustment_rng = None
+-                    if capture_update_audit:
+-                        batch = canonicalize_update_audit_batch(batch)
+-                        adjustment_rng = np.random.default_rng(
+-                            [int(self.config.data.get("seed", 1)), int(self.global_steps)]
+-                        )
+                     unadjusted_batch_size = len(batch)
+-                    batch = adjust_batch(self.config, batch, rng=adjustment_rng)
+-                    if urcr_config.enabled or capture_update_audit:
++                    batch = adjust_batch(self.config, batch)
++                    if urcr_config.enabled or capture_update_audit or v4_enabled:
+                         adjustment_copy = np.zeros(len(batch), dtype=bool)
+                         adjustment_copy[unadjusted_batch_size:] = True
+                         batch.non_tensor_batch["urcr_is_adjustment_copy"] = adjustment_copy
+@@ -436,6 +2231,57 @@ class EviSDRayTrainer(RayPPOTrainer):
                          old_log_prob.batch.pop("entropys")
                          batch = batch.union(old_log_prob)
  
--                    # Re-score each sampled action with its privileged teacher view.
-+                    evisd_cfg = self.config.algorithm.get("evisd", {})
-+                    evisd_enabled = bool(evisd_cfg.get("enable", False))
-+                    response_mask = batch.batch["response_mask"]
-+                    search_action_mask = torch.zeros_like(response_mask)
-+                    answer_action_mask = torch.zeros_like(response_mask)
-+                    official_action_mask = torch.zeros_like(response_mask)
-+                    modulation_mask = torch.zeros_like(response_mask)
-+                    score_search = False
-+                    answer_enable = False
-+                    teacher_score_row_mask = torch.zeros(
-+                        len(batch), dtype=torch.bool, device=response_mask.device
-+                    )
-+                    if evisd_enabled:
-+                        if evisd_cfg.get("action_only", False):
-+                            (
-+                                search_action_mask,
-+                                answer_action_mask,
-+                                official_action_mask,
-+                            ) = build_evisd_typed_action_masks(
-+                                batch=batch,
-+                                tokenizer=self.tokenizer,
-+                                response_mask=response_mask,
-+                            )
-+                        else:
-+                            search_action_mask = response_mask
-+                            answer_action_mask = response_mask
-+                            official_action_mask = response_mask
++                    if v4_enabled and v4_mode in {
++                        "pipeline_smoke",
++                        "calibration",
++                        "calibration_population",
++                    }:
++                        timer_name = f"urcr_v4_{v4_mode}"
++                        with _timer(timer_name, timing_raw):
++                            if v4_mode == "pipeline_smoke":
++                                self._run_urcr_v4_pipeline_smoke_batch(batch, v4_cfg)
++                            elif v4_mode == "calibration_population":
++                                from pathlib import Path
 +
-+                        answer_enable = bool(evisd_cfg.get("answer_enable", True))
-+                        search_main = bool(
-+                            evisd_cfg.get("search_enable_for_main_loss", True)
-+                        )
-+                        search_shadow = bool(
-+                            evisd_cfg.get("search_shadow_enable", False)
-+                        )
-+                        score_search = search_main or (
-+                            urcr_config.enabled and search_shadow
-+                        )
-+                        if score_search:
-+                            modulation_mask = modulation_mask + search_action_mask
-+                        if answer_enable:
-+                            modulation_mask = modulation_mask + answer_action_mask
-+                        modulation_mask = modulation_mask.clamp(max=1)
-+                        if score_search and answer_enable and not torch.equal(
-+                            modulation_mask.bool(),
-+                            official_action_mask.bool(),
-+                        ):
-+                            raise RuntimeError(
-+                                "Typed EviSD masks do not reconstruct the official action mask"
-+                            )
-+                        if evisd_cfg.get("action_only", False):
-+                            teacher_score_row_mask = modulation_mask.bool().any(dim=-1)
-+                        else:
-+                            teacher_score_row_mask = torch.ones(
-+                                len(batch),
-+                                dtype=torch.bool,
-+                                device=response_mask.device,
-+                            )
-+
-+                    # Re-score only actions whose PI correction reaches the selected objective.
-                     with _timer("teacher_forward", timing_raw):
--                        evisd_cfg = self.config.algorithm.get("evisd", {})
-                         _save_case_study = (
-                             evisd_cfg.get("save_case_study", False)
-                             and evisd_cfg.get("enable", False)
-                             and self.config.trainer.test_freq > 0
-                             and self.global_steps % self.config.trainer.test_freq == 0
-                         )
--                        _teacher_info = [] if _save_case_study else None
--                        teacher_log_probs = self._compute_teacher_log_probs(batch, teacher_info_out=_teacher_info)
-+                        _capture_intermediates = (
-+                            _save_case_study
-+                            or diagnostic_enabled
-+                            or urcr_config.enabled
-+                            or capture_update_audit
-+                        )
-+                        _teacher_info = [] if _capture_intermediates else None
-+                        if evisd_enabled:
-+                            teacher_log_probs, teacher_scored_rows = (
-+                                self._compute_teacher_log_probs(
++                                self._run_urcr_v4_calibration_batch(
 +                                    batch,
-+                                    teacher_info_out=_teacher_info,
-+                                    score_row_mask=teacher_score_row_mask,
++                                    v4_cfg,
++                                    timing_raw=timing_raw,
++                                    output_path=(
++                                        Path(str(v4_cfg.get("diagnostic_output")))
++                                        / f"calibration_batch_{v4_population_batch_index:02d}.json"
++                                    ),
++                                    calibration_identity={
++                                        "calibration_batch_index": (
++                                            v4_population_batch_index
++                                        ),
++                                        "calibration_data_manifest": str(
++                                            v4_population_entry["data_manifest"]
++                                        ),
++                                        "calibration_data_sha256": str(
++                                            v4_population_entry["data_sha256"]
++                                        ),
++                                        "calibration_population_manifest": str(
++                                            v4_population_manifest_path
++                                        ),
++                                        "calibration_population_manifest_sha256": (
++                                            v4_population_manifest_sha256
++                                        ),
++                                    },
 +                                )
-+                            )
-+                        else:
-+                            # The URCR-only path must not construct or score an
-+                            # EviSD privileged teacher prompt.  Preserve neutral
-+                            # tensor shapes solely for the frozen-turn exporter.
-+                            teacher_log_probs = batch.batch["old_log_probs"].detach().clone()
-+                            teacher_scored_rows = 0
-+                            if _teacher_info is not None:
-+                                _teacher_info.extend(
-+                                    {"teacher_scored": False} for _ in range(len(batch))
++                            else:
++                                self._run_urcr_v4_calibration_batch(
++                                    batch,
++                                    v4_cfg,
++                                    timing_raw=timing_raw,
 +                                )
-                         batch.batch["teacher_log_probs"] = teacher_log_probs
-+                        metrics["evisd/teacher_scored_row_count"] = float(
-+                            teacher_scored_rows
-+                        )
-+                        metrics["evisd/teacher_skipped_row_count"] = float(
-+                            len(batch) - teacher_scored_rows
-+                        )
-+                        metrics["evisd/teacher_scored_row_ratio"] = float(
-+                            teacher_scored_rows / max(1, len(batch))
-+                        )
-+                        answer_row_mask = answer_action_mask.bool().any(dim=-1)
-+                        search_row_mask = search_action_mask.bool().any(dim=-1)
-+                        expected_teacher_row_mask = torch.zeros_like(
-+                            teacher_score_row_mask
-+                        )
-+                        if score_search:
-+                            expected_teacher_row_mask |= search_row_mask
-+                        if answer_enable:
-+                            expected_teacher_row_mask |= answer_row_mask
-+                        if not torch.equal(
-+                            teacher_score_row_mask.bool(),
-+                            expected_teacher_row_mask.bool(),
-+                        ):
-+                            raise RuntimeError(
-+                                "EviSD scoped teacher rows diverge from the active action mask"
-+                            )
-+                        metrics["evisd/teacher_answer_row_count"] = float(
-+                            answer_row_mask.sum().item()
-+                        )
-+                        metrics[
-+                            "evisd/teacher_scored_search_only_row_count"
-+                        ] = float(
-+                            (
-+                                teacher_score_row_mask.bool()
-+                                & search_row_mask
-+                                & ~answer_row_mask
-+                            ).sum().item()
-+                        )
-+                        skipped_rows = ~teacher_score_row_mask.bool()
-+                        if skipped_rows.any():
-+                            skipped_delta_max = float(
-+                                (
-+                                    teacher_log_probs[skipped_rows]
-+                                    - batch.batch["old_log_probs"][skipped_rows]
-+                                ).abs().max().item()
-+                            )
-+                        else:
-+                            skipped_delta_max = 0.0
-+                        if skipped_delta_max != 0.0:
-+                            raise RuntimeError(
-+                                "Unscored EviSD teacher rows must have exactly zero delta"
-+                            )
-+                        metrics[
-+                            "evisd/teacher_skipped_delta_max"
-+                        ] = skipped_delta_max
-+                        if urcr_config.enabled:
-+                            if teacher_scored_rows or teacher_score_row_mask.any().item():
-+                                raise RuntimeError(
-+                                    "URCR-only path must not score privileged teacher rows"
-+                                )
-+                            if not torch.equal(
-+                                teacher_log_probs,
-+                                batch.batch["old_log_probs"].detach(),
++                        progress_bar.update(1)
++                        if v4_mode != "calibration_population" or is_last_step:
++                            progress_bar.close()
++                            return
++                        self.global_steps += 1
++                        continue
++
+                     evisd_cfg = self.config.algorithm.get("evisd", {})
+                     evisd_enabled = bool(evisd_cfg.get("enable", False))
+                     response_mask = batch.batch["response_mask"]
+@@ -651,14 +2497,43 @@ class EviSDRayTrainer(RayPPOTrainer):
+                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                         )
+ 
++                        if v4_enabled and v4_mode in {
++                            "gradient_calibration",
++                            "base_shadow",
++                        }:
++                            with _timer(
++                                f"urcr_v4_{v4_mode}", timing_raw
 +                            ):
-+                                raise RuntimeError(
-+                                    "URCR-only neutral teacher tensor diverged from actor log probabilities"
++                                self._run_urcr_v4_gradient_calibration(
++                                    batch,
++                                    v4_cfg,
++                                    timing_raw=timing_raw,
++                                    base_shadow=v4_mode == "base_shadow",
 +                                )
-+                            metrics["urcr/privileged_teacher_scored_row_count"] = 0.0
- 
-                     if self.use_reference_policy:
-                         with _timer("ref", timing_raw):
-@@ -254,20 +656,9 @@ class EviSDRayTrainer(RayPPOTrainer):
++                            progress_bar.close()
++                            return
++
++                        if v4_enabled and v4_mode == "train":
++                            with _timer("urcr_v4_pipeline", timing_raw):
++                                v4_metrics, v4_diagnostics_to_write = (
++                                    self._prepare_urcr_v4_local_batch(
++                                        batch,
++                                        v4_cfg,
++                                        v4_method,
++                                    )
++                                )
++                            metrics.update(v4_metrics)
++
+                         # Keep outcome-derived GRPO credit as the modulation anchor.
+                         response_mask = batch.batch["response_mask"]
                          student_log_probs = batch.batch["old_log_probs"]
-                         teacher_lp = batch.batch["teacher_log_probs"]
+-                        teacher_lp = batch.batch["teacher_log_probs"]
++                        teacher_lp = batch.batch.get("teacher_log_probs")
  
--                        evisd_cfg = self.config.algorithm.get("evisd", {})
                          _evisd_intermediates = None
--                        modulation_mask = None
--                        if evisd_cfg.get("enable", False):
--                            if evisd_cfg.get("action_only", False):
--                                # Localize privileged guidance to generated action spans.
--                                modulation_mask = build_evisd_action_mask(
--                                    batch=batch,
--                                    tokenizer=self.tokenizer,
--                                    response_mask=response_mask,
--                                    include_search=evisd_cfg.get("include_search", True),
--                                    include_answer=evisd_cfg.get("include_answer", True),
--                                )
--
-+                        _evisd_anchors = None
-+                        if evisd_enabled:
+                         _evisd_anchors = None
+                         if evisd_enabled:
++                            if teacher_lp is None:
++                                raise RuntimeError("EviSD enabled without teacher log-probs")
                              # Apply the bounded beta-scaled teacher-student correction.
                              modulation_result = apply_evisd_advantage_modulation(
                                  advantages=batch.batch["advantages"],
-@@ -277,9 +668,9 @@ class EviSDRayTrainer(RayPPOTrainer):
-                                 modulation_mask=modulation_mask,
-                                 beta=evisd_cfg.get("beta", 1.5),
-                                 evisd_lambda=evisd_cfg.get("lambda", 0.2),
--                                return_intermediates=_save_case_study,
-+                                return_intermediates=_capture_intermediates,
-                             )
--                            if _save_case_study:
-+                            if _capture_intermediates:
-                                 (
-                                     batch.batch["advantages"],
-                                     evisd_metrics,
-@@ -288,13 +679,616 @@ class EviSDRayTrainer(RayPPOTrainer):
-                             else:
-                                 batch.batch["advantages"], evisd_metrics = modulation_result
-                             metrics.update(evisd_metrics)
-+                            if urcr_config.enabled:
-+                                _evisd_anchors = build_evisd_advantage_anchors(
-+                                    outcome_advantages=_evisd_intermediates["advantages_before"],
-+                                    evisd_bonus=_evisd_intermediates["evisd_bonus"],
-+                                    response_mask=response_mask,
-+                                    search_mask=search_action_mask,
-+                                    answer_mask=answer_action_mask,
-+                                )
-+                                if urcr_config.compute_q0_shadow:
-+                                    metrics["evisd/q0_shadow_abs_mean"] = masked_mean(
-+                                        _evisd_anchors["q0_shadow"].abs(),
-+                                        search_action_mask,
-+                                    ).item()
-+                                metrics["evisd/answer_bonus_abs_mean"] = masked_mean(
-+                                    _evisd_anchors["answer_bonus"].abs(),
-+                                    answer_action_mask,
-+                                ).item()
-+                        elif urcr_config.enabled:
-+                            outcome_anchor = build_outcome_anchor(
-+                                batch.batch["advantages"],
-+                                response_mask,
-+                            )
-+                            zero = torch.zeros_like(outcome_anchor)
-+                            _evisd_intermediates = {
-+                                "delta": zero,
-+                                "evisd_score": zero,
-+                                "evisd_bonus": zero,
-+                                "advantages_before": outcome_anchor,
-+                            }
-+                            _evisd_anchors = {"outcome": outcome_anchor}
- 
--                        delta_t = (teacher_lp - student_log_probs) * response_mask
--                        metrics["evisd/teacher_student_gap_mean"] = masked_mean(delta_t, response_mask).item()
--                        metrics["evisd/teacher_student_gap_std"] = masked_mean(
--                            delta_t ** 2,
--                            response_mask,
--                        ).sqrt().item()
-+                        if urcr_config.enabled:
-+                            if (
-+                                _evisd_intermediates is None
-+                                or _evisd_anchors is None
-+                                or _teacher_info is None
-+                            ):
-+                                raise RuntimeError("Plan 05 requires captured EviSD intermediates")
-+                            urcr_action_mask = (
-+                                modulation_mask
-+                                if modulation_mask is not None
-+                                else torch.zeros_like(response_mask)
-+                            )
-+                            with _timer("urcr_source", timing_raw):
-+                                frozen_rows, _ = build_frozen_turn_rows(
-+                                    batch=batch,
-+                                    tokenizer=self.tokenizer,
-+                                    teacher_info=_teacher_info,
-+                                    evisd_intermediates=_evisd_intermediates,
-+                                    modulation_mask=urcr_action_mask,
-+                                    global_step=self.global_steps,
-+                                    include_search_modulation=score_search,
-+                                    include_answer_modulation=answer_enable,
-+                                    include_token_char_offsets=answer_agam_config.enabled,
-+                                )
-+                                if urcr_config.think_credit_mode != "whole_old":
-+                                    include_chunks = urcr_config.think_credit_mode in {
-+                                        "loo_mass50",
-+                                        "random_matched",
-+                                    }
-+                                    for frozen in frozen_rows:
-+                                        frozen.update(
-+                                            prepare_think_support(
-+                                                self.tokenizer,
-+                                                response_token_ids=frozen[
-+                                                    "response_token_ids"
-+                                                ],
-+                                                think_mask=frozen["think_mask"],
-+                                                include_chunks=include_chunks,
-+                                            )
-+                                        )
-+                                source_rows = build_online_g2_rows(
-+                                    frozen_rows,
-+                                    source_enabled=urcr_config.source_enabled,
-+                                    support_reward=urcr_config.support_reward,
-+                                )
-+
-+                            requires_responsibility = requires_urcr_responsibility(
-+                                urcr_config
-+                            )
-+                            score_indices = []
-+                            seen_score_turns = set()
-+                            for index, (frozen, source) in enumerate(zip(frozen_rows, source_rows)):
-+                                turn_uid = str(frozen["turn_uid"])
-+                                if (
-+                                    requires_responsibility
-+                                    and urcr_config.source_enabled
-+                                    and (
-+                                        urcr_config.uses_v2_fixed_support_reward
-+                                        or urcr_config.lambda_a > 0
-+                                    )
-+                                    and needs_responsibility_score(frozen, source)
-+                                    and turn_uid not in seen_score_turns
-+                                ):
-+                                    score_indices.append(index)
-+                                    seen_score_turns.add(turn_uid)
-+                            responsibility = {}
-+                            if score_indices:
-+                                with _timer("urcr_responsibility", timing_raw):
-+                                    score_batch = batch.select_idxs(np.asarray(score_indices))
-+                                    score_batch.batch["urcr_think_mask"] = build_response_span_tensor(
-+                                        batch.batch["response_mask"],
-+                                        score_indices,
-+                                        frozen_rows,
-+                                        "think_mask",
-+                                    )
-+                                    score_batch.batch["urcr_query_mask"] = build_response_span_tensor(
-+                                        batch.batch["response_mask"],
-+                                        score_indices,
-+                                        frozen_rows,
-+                                        "search_content_mask",
-+                                    )
-+                                    if urcr_config.think_credit_mode in {
-+                                        "loo_mass50",
-+                                        "random_matched",
-+                                    }:
-+                                        (
-+                                            score_batch.batch["urcr_chunk_mask"],
-+                                            score_batch.batch["urcr_chunk_count"],
-+                                        ) = build_response_chunk_tensor(
-+                                            batch.batch["response_mask"],
-+                                            score_indices,
-+                                            frozen_rows,
-+                                            max_chunks=MAX_CHUNKS,
-+                                        )
-+                                    score_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-+                                    score_batch.meta_info["urcr_micro_batch_size"] = int(
-+                                        self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-+                                    )
-+                                    from verl.protocol import (
-+                                        pad_dataproto_to_divisor,
-+                                        unpad_dataproto,
+@@ -1452,10 +3327,24 @@ class EviSDRayTrainer(RayPPOTrainer):
+                             if self.config.trainer.get("checkpoint_rotation", {}).get(
+                                 "enable", False
+                             ):
+-                                assert_plan06_training_step_health(
+-                                    metrics,
+-                                    global_step=self.global_steps,
+-                                )
++                                if v4_enabled and v4_mode == "train":
++                                    from verl.trainer.ppo.urcr_v4_resolution import (
++                                        assert_urcr_v4_training_step_health,
 +                                    )
 +
-+                                    score_batch, scorer_padding = pad_dataproto_to_divisor(
-+                                        score_batch,
-+                                        self.actor_rollout_wg.world_size,
-+                                    )
-+                                    scorer_output = self.actor_rollout_wg.compute_urcr_responsibility(score_batch)
-+                                    if "urcr_scorer_forward_batch_count" in scorer_output.batch:
-+                                        forward_batches = scorer_output.batch[
-+                                            "urcr_scorer_forward_batch_count"
-+                                        ]
-+                                        if int(forward_batches.min()) != int(
-+                                            forward_batches.max()
-+                                        ):
-+                                            raise RuntimeError(
-+                                                "URCR scorer reported unequal FSDP forward batch counts"
-+                                            )
-+                                        metrics[
-+                                            "urcr/scorer_forward_batches_per_rank"
-+                                        ] = float(forward_batches.max())
-+                                    if "urcr_localizer_padding_variant_count" in scorer_output.batch:
-+                                        padding_counts = scorer_output.batch[
-+                                            "urcr_localizer_padding_variant_count"
-+                                        ]
-+                                        rows_per_rank = len(padding_counts) // self.actor_rollout_wg.world_size
-+                                        if rows_per_rank * self.actor_rollout_wg.world_size != len(
-+                                            padding_counts
-+                                        ):
-+                                            raise RuntimeError(
-+                                                "URCR scorer padding audit lost equal rank shards"
-+                                            )
-+                                        metrics[
-+                                            "urcr/localizer_padding_variant_count"
-+                                        ] = float(
-+                                            padding_counts.reshape(
-+                                                self.actor_rollout_wg.world_size,
-+                                                rows_per_rank,
-+                                            )[:, 0].sum()
-+                                        )
-+                                    scorer_output = unpad_dataproto(
-+                                        scorer_output, scorer_padding
-+                                    )
-+                                    score_batch = unpad_dataproto(
-+                                        score_batch, scorer_padding
-+                                    )
-+                                if not scorer_output.batch["urcr_scorer_no_grad"].all().item():
-+                                    raise RuntimeError("Plan 05 responsibility scorer no-grad audit failed")
-+                                if not scorer_output.batch["urcr_backend_restored"].all().item():
-+                                    raise RuntimeError("Plan 05 responsibility scorer did not restore attention backend")
-+                                for output_index, batch_index in enumerate(score_indices):
-+                                    turn_uid = str(frozen_rows[batch_index]["turn_uid"])
-+                                    query_mask = score_batch.batch["urcr_query_mask"][output_index].bool()
-+                                    full_values = scorer_output.batch["urcr_full_query_log_probs"][output_index][query_mask]
-+                                    masked_values = scorer_output.batch["urcr_masked_query_log_probs"][output_index][query_mask]
-+                                    old_values = score_batch.batch["old_log_probs"][output_index][query_mask]
-+                                    errors = (full_values - old_values).abs()
-+                                    responsibility[turn_uid] = {
-+                                        "d_mask": float(scorer_output.batch["urcr_d_mask"][output_index]),
-+                                        "rho": float(scorer_output.batch["urcr_rho"][output_index]),
-+                                        "rho_scored": True,
-+                                        "full_query_logp_token": full_values.tolist(),
-+                                        "masked_query_logp_token": masked_values.tolist(),
-+                                        "old_query_logp_token": old_values.tolist(),
-+                                        "full_old_mean_abs_error": float(errors.mean()),
-+                                        "full_old_max_token_error": float(errors.max()),
-+                                    }
-+                                    if "urcr_chunk_loo_scores" in scorer_output.batch:
-+                                        chunk_count = int(
-+                                            scorer_output.batch["urcr_chunk_count"]
-+                                            [output_index]
-+                                        )
-+                                        chunk_scores = scorer_output.batch[
-+                                            "urcr_chunk_loo_scores"
-+                                        ][output_index, :chunk_count]
-+                                        responsibility[turn_uid].update(
-+                                            {
-+                                                "chunk_loo_scores": chunk_scores.tolist(),
-+                                                "localizer_forward_count": int(
-+                                                    scorer_output.batch[
-+                                                        "urcr_localizer_forward_count"
-+                                                    ][output_index]
-+                                                ),
-+                                            }
-+                                        )
-+
-+                            with _timer("urcr_routing", timing_raw):
-+                                urcr_anchor = _evisd_anchors["outcome"]
-+                                profile_advantages = {}
-+                                profile_components = {}
-+                                routing_profiles = {
-+                                    "g2_query_only": "zero",
-+                                    "g2_full": "full",
-+                                    "g2_shuffled": "shuffled",
-+                                    "g2_real": "real",
-+                                }
-+                                urcr_v2_local_tensors = None
-+                                if urcr_config.uses_v2_fixed_support_reward:
-+                                    urcr_v2_local_tensors, urcr_components = (
-+                                        build_v2_local_routing(
-+                                            response_mask,
-+                                            frozen_rows,
-+                                            source_rows,
-+                                            responsibility,
-+                                            base_query_reward=(
-+                                                urcr_config.support_reward.base_query_reward
-+                                            ),
-+                                            lambda_r=urcr_config.local_objective.lambda_r,
-+                                            mode=urcr_config.routing_mode,
-+                                            shuffle_seed=urcr_config.shuffle_seed,
-+                                            think_length_ref=(
-+                                                urcr_config.local_objective.think_length_ref
-+                                            ),
-+                                            positive_mass_fraction=(
-+                                                urcr_config.positive_mass_fraction
-+                                            ),
-+                                        )
-+                                    )
-+                                    selected_advantages = urcr_anchor.detach().clone()
-+                                    profile_advantages[urcr_config.method] = selected_advantages
-+                                    profile_components[urcr_config.method] = urcr_components
-+                                else:
-+                                    methods_to_route = (
-+                                        tuple(routing_profiles)
-+                                        if urcr_config.compute_shadow_modes
-+                                        else (
-+                                            (urcr_config.method,)
-+                                            if urcr_config.method in routing_profiles
-+                                            else ()
-+                                        )
-+                                    )
-+                                    for method_name in methods_to_route:
-+                                        routed, components = apply_urcr_routing(
-+                                            urcr_anchor,
-+                                            response_mask,
-+                                            frozen_rows,
-+                                            source_rows,
-+                                            responsibility,
-+                                            lambda_a=urcr_config.lambda_a,
-+                                            lambda_r=urcr_config.lambda_r,
-+                                            mode=routing_profiles[method_name],
-+                                            shuffle_seed=urcr_config.shuffle_seed,
-+                                            think_credit_mode=urcr_config.think_credit_mode,
-+                                            whole_fix_scale=urcr_config.whole_fix_scale,
-+                                            local_scale=urcr_config.local_scale,
-+                                            positive_mass_fraction=urcr_config.positive_mass_fraction,
-+                                            localizer_seed=urcr_config.localizer_seed,
-+                                        )
-+                                        profile_advantages[method_name] = routed
-+                                        profile_components[method_name] = components
-+
-+                                    if urcr_config.method in profile_components:
-+                                        urcr_components = profile_components[urcr_config.method]
-+                                    else:
-+                                        _, urcr_components = apply_urcr_routing(
-+                                            urcr_anchor,
-+                                            response_mask,
-+                                            frozen_rows,
-+                                            source_rows,
-+                                            responsibility,
-+                                            lambda_a=0.0,
-+                                            lambda_r=0.0,
-+                                            mode="zero",
-+                                            shuffle_seed=urcr_config.shuffle_seed,
-+                                            think_credit_mode=urcr_config.think_credit_mode,
-+                                            whole_fix_scale=urcr_config.whole_fix_scale,
-+                                            local_scale=urcr_config.local_scale,
-+                                            positive_mass_fraction=urcr_config.positive_mass_fraction,
-+                                            localizer_seed=urcr_config.localizer_seed,
-+                                        )
-+                                    selected_advantages = profile_advantages[urcr_config.method]
-+
-+                                if urcr_config.compute_shadow_modes:
-+                                    missing_profiles = set(routing_profiles) - set(profile_advantages)
-+                                    if missing_profiles:
-+                                        raise RuntimeError(
-+                                            "Plan05-MIX profile construction is incomplete: "
-+                                            f"{sorted(missing_profiles)}"
-+                                        )
-+                                    real_components = profile_components["g2_real"]
-+                                    shuffled_components = profile_components["g2_shuffled"]
-+                                    eligible_pairs = [
-+                                        (real, shuffled)
-+                                        for real, shuffled in zip(
-+                                            real_components,
-+                                            shuffled_components,
-+                                        )
-+                                        if real["c_query_total"] > 0
-+                                        and real["think_token_count"] > 0
-+                                        and not real["is_adjustment_copy"]
-+                                    ]
-+                                    real_rho = sorted(pair[0]["rho_used"] for pair in eligible_pairs)
-+                                    shuffled_rho = sorted(
-+                                        pair[1]["rho_used"] for pair in eligible_pairs
-+                                    )
-+                                    rho_marginal_error = max(
-+                                        [
-+                                            abs(left - right)
-+                                            for left, right in zip(real_rho, shuffled_rho)
-+                                        ]
-+                                        + [0.0]
-+                                    )
-+                                    metrics[
-+                                        "urcr_shadow/real_shuffled_rho_marginal_max_error"
-+                                    ] = rho_marginal_error
-+                                    metrics[
-+                                        "urcr_shadow/real_shuffled_pairing_changed_count"
-+                                    ] = float(
-+                                        sum(
-+                                            abs(real["rho_used"] - shuffled["rho_used"])
-+                                            > 1e-12
-+                                            for real, shuffled in eligible_pairs
-+                                        )
-+                                    )
-+                                    metrics[
-+                                        "urcr_shadow/real_shuffled_eligible_count"
-+                                    ] = float(len(eligible_pairs))
-+                                    actor_loss_mask = (
-+                                        batch.batch["loss_mask"][:, -response_mask.shape[1] :]
-+                                        if self.config.actor_rollout_ref.rollout.multi_turn.enable
-+                                        else response_mask
-+                                    )
-+                                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-+                                    pg_loss_coef = self.config.actor_rollout_ref.actor.get("pg_loss_coef", 1.0)
-+                                    common_actor_loss = torch.zeros(
-+                                        (), dtype=urcr_anchor.dtype, device=urcr_anchor.device
-+                                    )
-+                                    entropy_coeff = self.config.actor_rollout_ref.actor.entropy_coeff
-+                                    if entropy_coeff != 0:
-+                                        shadow_entropy_loss = agg_loss(
-+                                            loss_mat=entropys,
-+                                            loss_mask=actor_loss_mask,
-+                                            loss_agg_mode=loss_agg_mode,
-+                                        )
-+                                        common_actor_loss -= shadow_entropy_loss * entropy_coeff
-+                                        metrics["urcr_shadow/common_entropy_loss"] = shadow_entropy_loss.item()
-+                                    if self.config.actor_rollout_ref.actor.use_kl_loss:
-+                                        shadow_kld = kl_penalty(
-+                                            logprob=student_log_probs,
-+                                            ref_logprob=batch.batch["ref_log_prob"],
-+                                            kl_penalty=self.config.actor_rollout_ref.actor.kl_loss_type,
-+                                        )
-+                                        shadow_kl_loss = agg_loss(
-+                                            loss_mat=shadow_kld,
-+                                            loss_mask=actor_loss_mask,
-+                                            loss_agg_mode=loss_agg_mode,
-+                                        )
-+                                        common_actor_loss += (
-+                                            shadow_kl_loss
-+                                            * self.config.actor_rollout_ref.actor.kl_loss_coef
-+                                        )
-+                                        metrics["urcr_shadow/common_kl_loss"] = shadow_kl_loss.item()
-+                                    for profile_name in routing_profiles:
-+                                        shadow_advantages = profile_advantages[profile_name]
-+                                        shadow_pg_loss = agg_loss(
-+                                            loss_mat=-shadow_advantages,
-+                                            loss_mask=actor_loss_mask,
-+                                            loss_agg_mode=loss_agg_mode,
-+                                        )
-+                                        metrics[f"urcr_shadow/{profile_name}_pg_loss_ratio1"] = (
-+                                            shadow_pg_loss.item()
-+                                        )
-+                                        metrics[f"urcr_shadow/{profile_name}_actor_loss_ratio1"] = (
-+                                            shadow_pg_loss * pg_loss_coef + common_actor_loss
-+                                        ).item()
-+                                    if urcr_config.save_surrogate_coefficients:
-+                                        for profile_name in routing_profiles:
-+                                            batch.batch[
-+                                                f"urcr_profile_adv_{profile_name}"
-+                                            ] = profile_advantages[profile_name]
-+
-+                                if answer_agam_config.enabled:
-+                                    with _timer("answer_agam", timing_raw):
-+                                        effective_answer_lambda = (
-+                                            linear_annealed_answer_lambda(
-+                                                answer_agam_config.lambda_start,
-+                                                global_step=self.global_steps,
-+                                                total_training_steps=self.total_training_steps,
-+                                            )
-+                                        )
-+                                        agam_application = apply_answer_agam(
-+                                            selected_advantages,
-+                                            urcr_anchor,
-+                                            response_mask,
-+                                            frozen_rows,
-+                                            self.tokenizer,
-+                                            lambda_effective=effective_answer_lambda,
-+                                        )
-+                                        selected_advantages = agam_application.advantages
-+                                        profile_advantages[
-+                                            urcr_config.method
-+                                        ] = selected_advantages
-+                                        metrics.update(agam_application.metrics)
-+                                        metrics["agam/lambda_start"] = float(
-+                                            answer_agam_config.lambda_start
-+                                        )
-+                                        metrics["agam/lambda_effective"] = float(
-+                                            effective_answer_lambda
-+                                        )
-+                                        metrics["agam/anneal_progress"] = float(
-+                                            1.0
-+                                            - effective_answer_lambda
-+                                            / answer_agam_config.lambda_start
-+                                            if answer_agam_config.lambda_start > 0
-+                                            else 1.0
-+                                        )
-+                                        actor_loss_mask = (
-+                                            batch.batch["loss_mask"][
-+                                                :, -response_mask.shape[1] :
-+                                            ]
-+                                            if self.config.actor_rollout_ref.rollout.multi_turn.enable
-+                                            else response_mask
-+                                        )
-+                                        metrics["agam/residual_pg_loss_ratio1"] = float(
-+                                            agg_loss(
-+                                                loss_mat=-agam_application.residual,
-+                                                loss_mask=actor_loss_mask,
-+                                                loss_agg_mode=(
-+                                                    self.config.actor_rollout_ref.actor.loss_agg_mode
-+                                                ),
-+                                            ).item()
-+                                        )
-+                                    for frozen in frozen_rows:
-+                                        frozen.pop("_token_char_offsets", None)
-+                                all_row_indices = list(range(len(frozen_rows)))
-+                                query_span_mask = build_response_span_tensor(
-+                                    response_mask,
-+                                    all_row_indices,
-+                                    frozen_rows,
-+                                    "search_content_mask",
-+                                )
-+                                think_span_mask = build_response_span_tensor(
-+                                    response_mask,
-+                                    all_row_indices,
-+                                    frozen_rows,
-+                                    "think_mask",
-+                                )
-+                                urcr_residual = (
-+                                    selected_advantages - urcr_anchor
-+                                    if urcr_config.method.startswith("g2_")
-+                                    else torch.zeros_like(urcr_anchor)
-+                                )
-+                                if urcr_config.think_credit_mode != "whole_old":
-+                                    think_tag_mask = build_response_span_tensor(
-+                                        response_mask,
-+                                        all_row_indices,
-+                                        frozen_rows,
-+                                        "think_tag_mask",
-+                                    )
-+                                    tag_residual = (
-+                                        urcr_residual * think_tag_mask
-+                                    ).detach()
-+                                    metrics[
-+                                        "urcr/localized_tag_residual_nonzero_count"
-+                                    ] = float(torch.count_nonzero(tag_residual))
-+                                    metrics[
-+                                        "urcr/localized_tag_residual_max_abs"
-+                                    ] = float(
-+                                        tag_residual.abs().max()
-+                                        if tag_residual.numel()
-+                                        else 0.0
-+                                    )
-+                                if not urcr_config.uses_v2_fixed_support_reward:
-+                                    batch.batch["urcr_query_span_mask"] = query_span_mask
-+                                    batch.batch["urcr_think_span_mask"] = think_span_mask
-+                                    batch.batch["urcr_query_residual"] = (
-+                                        urcr_residual * query_span_mask
-+                                    )
-+                                    batch.batch["urcr_think_residual"] = (
-+                                        urcr_residual * think_span_mask
-+                                    )
-+                                batch.batch["advantages"] = selected_advantages
-+                                if urcr_v2_local_tensors is not None:
-+                                    for key, value in urcr_v2_local_tensors.items():
-+                                        batch.batch[key] = value.detach()
-+                                    warmup_steps = urcr_config.local_objective.warmup_steps
-+                                    local_warmup_fraction = (
-+                                        1.0
-+                                        if warmup_steps == 0
-+                                        else min(1.0, self.global_steps / warmup_steps)
-+                                    )
-+                                    local_alpha = effective_local_alpha(
-+                                        local_max=urcr_config.local_objective.local_max,
++                                    assert_urcr_v4_training_step_health(
++                                        metrics,
 +                                        global_step=self.global_steps,
-+                                        warmup_steps=warmup_steps,
-+                                    )
-+                                    batch.meta_info["urcr_v2_local_objective"] = {
-+                                        "alpha": float(local_alpha),
-+                                        "query_loss_weight": float(
-+                                            urcr_config.local_objective.query_loss_weight
++                                        expected_trajectory_count=(
++                                            int(self.config.data.train_batch_size)
++                                            * int(self.config.env.rollout.n)
 +                                        ),
-+                                        "think_loss_weight": float(
-+                                            urcr_config.local_objective.think_loss_weight
-+                                        ),
-+                                        "think_length_ref": float(
-+                                            urcr_config.local_objective.think_length_ref
-+                                        ),
-+                                    }
-+                                    metrics["urcr_v2/local_max"] = float(
-+                                        urcr_config.local_objective.local_max
 +                                    )
-+                                    metrics["urcr_v2/local_warmup_fraction"] = float(
-+                                        local_warmup_fraction
++                                else:
++                                    assert_plan06_training_step_health(
++                                        metrics,
++                                        global_step=self.global_steps,
 +                                    )
-+                                    metrics["urcr_v2/local_alpha"] = float(local_alpha)
-+                                metrics[
-+                                    "urcr/selected_profile_advantage_max_error"
-+                                ] = assert_selected_profile_advantages(
-+                                    batch.batch["advantages"],
-+                                    profile_advantages[urcr_config.method],
-+                                    method=urcr_config.method,
-+                                )
-+                                selected_profile_key = (
-+                                    f"urcr_profile_adv_{urcr_config.method}"
-+                                )
-+                                if selected_profile_key in batch.batch:
-+                                    if answer_agam_config.enabled:
-+                                        batch.batch[selected_profile_key] = selected_advantages
-+                                    assert_selected_profile_advantages(
-+                                        batch.batch["advantages"],
-+                                        batch.batch[selected_profile_key],
-+                                        method=urcr_config.method,
-+                                    )
-+                                if urcr_config.compute_q0_shadow:
-+                                    batch.batch["urcr_q0_shadow"] = _evisd_anchors[
-+                                        "q0_shadow"
-+                                    ]
-+                                urcr_components = enrich_urcr_components(
-+                                    urcr_components,
-+                                    frozen_rows=frozen_rows,
-+                                    response_mask=response_mask,
-+                                    final_advantages=selected_advantages,
-+                                    evisd_bonus=_evisd_intermediates["evisd_bonus"],
-+                                    responsibility=responsibility,
-+                                    global_step=self.global_steps,
-+                                )
-+                                for component in urcr_components:
-+                                    component["method"] = urcr_config.method
-+                                metrics.update(summarize_urcr_components(urcr_components))
-+                                if urcr_config.save_turn_components and (
-+                                    urcr_config.turn_component_steps is None
-+                                    or self.global_steps in urcr_config.turn_component_steps
-+                                ):
-+                                    urcr_components_to_write = urcr_components
-+
-+                        if urcr_config.capture_update_vectors:
-+                            if _evisd_intermediates is None or _teacher_info is None:
-+                                raise RuntimeError("Plan 05 update audit requires captured EviSD intermediates")
-+                            update_audit_mask = (
-+                                modulation_mask
-+                                if modulation_mask is not None
-+                                else torch.zeros_like(response_mask)
-+                            )
-+                            with _timer("urcr_update_audit_dump", timing_raw):
-+                                frozen_path, query_path = write_frozen_turn_batch(
-+                                    batch=batch,
-+                                    tokenizer=self.tokenizer,
-+                                    teacher_info=_teacher_info,
-+                                    evisd_intermediates=_evisd_intermediates,
-+                                    modulation_mask=update_audit_mask,
-+                                    output_dir=urcr_config.audit_output_dir,
-+                                    global_step=self.global_steps,
-+                                    artifact_prefix="update_audit_",
-+                                )
-+                            print(
-+                                "[URCR Plan 05] wrote update-audit frozen batch: "
-+                                f"{frozen_path}, {query_path}"
-+                            )
-+
-+                        if evisd_enabled:
-+                            delta_t = (teacher_lp - student_log_probs) * response_mask
-+                            metrics["evisd/teacher_student_gap_mean"] = masked_mean(
-+                                delta_t,
-+                                response_mask,
-+                            ).item()
-+                            metrics["evisd/teacher_student_gap_std"] = masked_mean(
-+                                delta_t ** 2,
-+                                response_mask,
-+                            ).sqrt().item()
-                         metrics.update(compute_group_reward_separability_metrics(batch=batch))
-                         metrics.update(
-                             compute_traj_credit_metrics(
-@@ -410,19 +1404,58 @@ class EviSDRayTrainer(RayPPOTrainer):
-                             print(f"[EviSD Case Study] Saved {total_saved} samples "
-                                   f"({len(selected_groups)} groups, {len(paired_groups[:n_groups])} paired) to {save_path}")
- 
--                    if self.use_critic:
--                        with _timer("update_critic", timing_raw):
--                            critic_output = self.critic_wg.update_critic(batch)
--                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
--                        metrics.update(critic_output_metrics)
--
--                    if self.config.trainer.critic_warmup <= self.global_steps:
--                        with _timer("update_actor", timing_raw):
--                            # Standard GRPO update using the EviSD-modulated advantages.
--                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
--                            actor_output = self.actor_rollout_wg.update_actor(batch)
--                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
--                        metrics.update(actor_output_metrics)
-+                    if diagnostic_enabled:
-+                        if _evisd_intermediates is None or _teacher_info is None:
-+                            raise RuntimeError("URCR diagnostic intermediates were not captured")
-+                        diagnostic_mask = (
-+                            modulation_mask
-+                            if modulation_mask is not None
-+                            else torch.zeros_like(batch.batch["response_mask"])
-+                        )
-+                        with _timer("urcr_diagnostic_dump", timing_raw):
-+                            frozen_path, query_path = write_frozen_turn_batch(
-+                                batch=batch,
-+                                tokenizer=self.tokenizer,
-+                                teacher_info=_teacher_info,
-+                                evisd_intermediates=_evisd_intermediates,
-+                                modulation_mask=diagnostic_mask,
-+                                output_dir=diagnostic_output_dir,
-+                                global_step=self.global_steps,
-+                                artifact_prefix=diagnostic_artifact_prefix,
-+                            )
-+                        print(
-+                            "[URCR] wrote no-update diagnostic parts: "
-+                            f"{frozen_path}, {query_path}"
-+                        )
-+                        metrics["urcr_diagnostics/no_optimizer_update"] = 1.0
-+                    else:
-+                        if self.use_critic:
-+                            with _timer("update_critic", timing_raw):
-+                                critic_output = self.critic_wg.update_critic(batch)
-+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-+                            metrics.update(critic_output_metrics)
-+
-+                        if self.config.trainer.critic_warmup <= self.global_steps:
-+                            with _timer("update_actor", timing_raw):
-+                                # Standard GRPO update using the selected outcome/URCR advantages.
-+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-+                                if capture_update_audit:
-+                                    batch.meta_info["urcr_update_audit"] = {
-+                                        "reference_dir": urcr_config.update_reference_dir,
-+                                        "save_reference": urcr_config.save_update_reference,
-+                                        "compare_reference": urcr_config.compare_update_reference,
-+                                        "summary_only": urcr_config.capture_update_summary,
-+                                    }
-+                                actor_output = self.actor_rollout_wg.update_actor(batch)
-+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-+                            metrics.update(actor_output_metrics)
-+                            if self.config.trainer.get("checkpoint_rotation", {}).get(
-+                                "enable", False
-+                            ):
-+                                assert_plan06_training_step_health(
-+                                    metrics,
-+                                    global_step=self.global_steps,
-+                                )
  
                      rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                      if rollout_data_dir:
-@@ -439,17 +1472,26 @@ class EviSDRayTrainer(RayPPOTrainer):
+@@ -1491,6 +3380,14 @@ class EviSDRayTrainer(RayPPOTrainer):
+                                 global_step=self.global_steps,
                              )
- 
-                     test_start_step = self.config.trainer.get("test_start_step", 0)
--                    if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or (self.global_steps >= test_start_step and self.global_steps % self.config.trainer.test_freq == 0)):
-+                    if not diagnostic_enabled and self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or (self.global_steps >= test_start_step and self.global_steps % self.config.trainer.test_freq == 0)):
-                         with _timer("testing", timing_raw):
-                             val_metrics: dict = self._validate()
-                             if is_last_step:
-                                 last_val_metrics = val_metrics
-                         metrics.update(val_metrics)
- 
--                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-+                    if not diagnostic_enabled and self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
-                         with _timer("save_checkpoint", timing_raw):
-                             self._save_checkpoint()
- 
-+                    if urcr_components_to_write is not None:
-+                        with _timer("urcr_component_write", timing_raw):
-+                            component_path = write_turn_component_part(
-+                                urcr_components_to_write,
-+                                output_dir=urcr_config.audit_output_dir,
-+                                global_step=self.global_steps,
+                         print(f"[URCR Plan 05] wrote turn components: {component_path}")
++                    if v4_diagnostics_to_write is not None:
++                        with _timer("urcr_v4_component_write", timing_raw):
++                            component_path = self._write_urcr_v4_turn_components(
++                                v4_diagnostics_to_write,
++                                v4_cfg,
++                                v4_method_identity,
 +                            )
-+                        print(f"[URCR Plan 05] wrote turn components: {component_path}")
-+
++                        print(f"[URCR-V4] wrote turn components: {component_path}")
+ 
                  metrics.update({
                      "training/global_step": self.global_steps,
-                     "training/epoch": epoch,
-@@ -459,11 +1501,35 @@ class EviSDRayTrainer(RayPPOTrainer):
-                 n_gpus = self.resource_pool_manager.get_n_gpus()
-                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
- 
-+                if urcr_config.enabled or capture_update_audit:
-+                    step_metrics_path = write_step_metrics(
-+                        metrics,
-+                        output_dir=urcr_config.audit_output_dir,
-+                        global_step=self.global_steps,
-+                    )
-+                    print(f"[URCR Plan 05] wrote step metrics: {step_metrics_path}")
-+                if training_batch_record is not None:
-+                    batch_manifest_path = append_training_batch_record(
-+                        training_batch_record,
-+                        output_dir=urcr_config.audit_output_dir,
-+                    )
-+                    print(
-+                        "[URCR Plan 06] appended scientific batch identity: "
-+                        f"{batch_manifest_path}"
-+                    )
-+
-                 logger.log(data=metrics, step=self.global_steps)
- 
-                 progress_bar.update(1)
-                 self.global_steps += 1
-                 if is_last_step:
--                    pprint(f"Final validation metrics: {last_val_metrics}")
-+                    if diagnostic_enabled:
-+                        summary = consolidate_frozen_turn_parts(
-+                            diagnostic_output_dir,
-+                            artifact_prefix=diagnostic_artifact_prefix,
-+                        )
-+                        pprint(f"URCR Plan 02 collection summary: {summary}")
-+                    else:
-+                        pprint(f"Final validation metrics: {last_val_metrics}")
-                     progress_bar.close()
-                     return

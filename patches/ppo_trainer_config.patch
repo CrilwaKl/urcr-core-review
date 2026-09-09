@@ -1,0 +1,44 @@
+diff --git a/verl/trainer/config/ppo_trainer.yaml b/verl/trainer/config/ppo_trainer.yaml
+index 83341ed..b72ccb8 100644
+--- a/verl/trainer/config/ppo_trainer.yaml
++++ b/verl/trainer/config/ppo_trainer.yaml
+@@ -310,12 +310,38 @@ algorithm:
+       save_update_reference: False
+       compare_update_reference: False
+       update_reference_dir: null
++  urcr_v4:
++    enable: False
++    mode: train
++    diagnostic_output: null
++    numeric_reference_artifact: null
++    pipeline_smoke_search_anchors: 16
++    pipeline_smoke_query_responsibility_anchors: 8
++    pipeline_smoke_answer_responsibility_anchors: 8
++    calibration_search_anchors: 256
++    calibration_query_responsibility_anchors: 64
++    calibration_answer_responsibility_anchors: 64
++    calibration_population_manifest: null
++    calibration_population_start_batch: 2
++    calibration_population_end_batch: 10
++    pooled_calibration_artifact: null
++    gradient_calibration_artifact: null
++    resolved_method_artifact: null
++    resolved_method_sha256: null
++    run_id: null
++    turn_component_dir: null
++    full_component_steps: [1, 2, 3, 4, 5, 30, 150, 300]
++    sampled_turns_per_step: 8
++    scorer:
++      max_total_tokens: 8192
++      micro_batch_size_per_gpu: 32
++      token_budget_per_gpu: 262144
++      smoke_micro_batch_sizes_per_gpu: [8, 16, 32]
+   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
+     enable: False
+     max_num_gen_batches: 10
+ 
+ trainer:
+-  seed: null
+   balance_batch: True
+   total_epochs: 30
+   total_training_steps: null

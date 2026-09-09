@@ -1,0 +1,78 @@
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index 7f4b381..f914d06 100644
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -242,6 +242,7 @@ class TrajectoryCollector:
+             success: Dict[str, np.ndarray],
+             traj_uid: np.ndarray,
+             tool_callings: np.ndarray,
++            terminal_binary_em: np.ndarray | None = None,
+             ) -> DataProto:
+         """
+         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
+@@ -253,10 +254,18 @@ class TrajectoryCollector:
+             success (Dict[str, np.ndarray]): Success samples for each environment
+             traj_uid (np.ndarray): Trajectory unique identifiers
+             tool_callings (np.ndarray): Number of tool callings for each environment
++            terminal_binary_em (np.ndarray | None): Raw per-trajectory binary
++                outcome for URCR-V4, before shaped reward penalties.
+         Returns:
+             DataProto: Collected and organized trajectory data
+         """
+         batch_size = len(total_batch_list)
++        if terminal_binary_em is not None:
++            terminal_binary_em = np.asarray(terminal_binary_em)
++            if terminal_binary_em.shape != (batch_size,):
++                raise ValueError("terminal_binary_em must match the trajectory batch")
++            if not np.isin(terminal_binary_em.astype(float), (0.0, 1.0)).all():
++                raise ValueError("terminal_binary_em must contain only binary outcomes")
+ 
+         success_rate = {}
+         for key, value in success.items():
+@@ -276,6 +285,8 @@ class TrajectoryCollector:
+                     data['tool_callings'] = tool_callings[bs]
+                     # turn_step: which step within the trajectory
+                     data['turn_step'] = step_idx
++                    if terminal_binary_em is not None:
++                        data['terminal_binary_em'] = int(terminal_binary_em[bs])
+                     # success_rate
+                     for key, value in success_rate.items():
+                         data[key] = value
+@@ -310,6 +321,9 @@ class TrajectoryCollector:
+         """
+ 
+         batch_size = len(gen_batch.batch)
++        v4_enabled = bool(
++            self.config.algorithm.get("urcr_v4", {}).get("enable", False)
++        )
+ 
+         # Initial observations from the environment
+         reset_kwargs = gen_batch.non_tensor_batch.pop('env_kwargs', None)
+@@ -366,7 +380,10 @@ class TrajectoryCollector:
+             batch.non_tensor_batch['traj_uid'] = traj_uid
+             if reset_kwargs is not None:
+                 batch.non_tensor_batch['env_kwargs'] = reset_kwargs
+-            for key in ("reward_model", "metadata", "extra_info"):
++            copied_fields = ["reward_model", "extra_info"]
++            if not v4_enabled:
++                copied_fields.append("metadata")
++            for key in copied_fields:
+                 if key in gen_batch.non_tensor_batch:
+                     batch.non_tensor_batch[key] = gen_batch.non_tensor_batch[key]
+ 
+@@ -549,6 +566,15 @@ class TrajectoryCollector:
+             success=total_success,
+             traj_uid=total_traj_uid,
+             tool_callings=totoal_tool_callings,
++            terminal_binary_em=(
++                total_success["success_rate"]
++                if bool(
++                    self.config.algorithm.get("urcr_v4", {}).get(
++                        "enable", False
++                    )
++                )
++                else None
++            ),
+         )
+         
+         return gen_batch_output

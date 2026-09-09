@@ -1,0 +1,360 @@
+{
+  "answer_utility": {
+    "all_equal_credit": 0.0,
+    "baseline": "within_stratum_mean_including_self",
+    "beta": 0.5,
+    "dependence_on_a_out": false,
+    "quality": "evaluator_consistent_word_fbeta",
+    "residual_group": "rollout_group_id_and_binary_em",
+    "singleton_credit": 0.0,
+    "std_normalization": false
+  },
+  "artifact": "urcr_v4_resolved_method",
+  "calibration": {
+    "base_shadow": {
+      "artifact": "/data2/kongmu/agentic-RL/EviSD-URCR/artifacts/urcr_v4/base_shadow_gradient_calibration.json",
+      "full_strength_local_over_global": 0.05213596939129947,
+      "global_over_local": [
+        0.8960920983602075
+      ],
+      "lambda_max_after": 0.04671863021189309,
+      "lambda_max_before": 0.04671863021189309,
+      "lowered_lambda": false,
+      "optimizer_update_executed": false,
+      "sha256": "427b733b4b0191615484b6d7ee95e428c30c608203ca7c65d6e87623e3cd21a5"
+    },
+    "population": {
+      "artifact": "/data2/kongmu/agentic-RL/EviSD-URCR/artifacts/urcr_v4/calibration_population/pooled_calibration_10_batches.json",
+      "batch_count": 10,
+      "last_three_prefix_ranges": {
+        "delta_R_A": {
+          "absolute_range": 0.013984664678574066,
+          "range_over_final_absolute_value": 0.09014789973429073
+        },
+        "delta_R_Q": {
+          "absolute_range": 0.0008206320802369854,
+          "range_over_final_absolute_value": 0.010123051657457848
+        },
+        "delta_U": {
+          "absolute_range": 0.0,
+          "range_over_final_absolute_value": 0.0
+        },
+        "s_R_A": {
+          "absolute_range": 0.03443162004152933,
+          "range_over_final_absolute_value": 0.04119889070940378
+        },
+        "s_R_Q": {
+          "absolute_range": 0.018035211165746134,
+          "range_over_final_absolute_value": 0.041787000552218005
+        },
+        "s_U": {
+          "absolute_range": 0.0,
+          "range_over_final_absolute_value": 0.0
+        }
+      },
+      "limitations": [],
+      "question_count": 1280,
+      "sha256": "6f0ff71b8e3683bdddc1437ae10e4a02df93d1652715cf5f85c01014f50d602f",
+      "status": "pass",
+      "trajectory_count": 10240
+    },
+    "s150_gradient": {
+      "artifact": "/data2/kongmu/agentic-RL/EviSD-URCR/artifacts/urcr_v4/s150_gradient_calibration.json",
+      "full_strength_local_over_global_max": 0.1313894463962956,
+      "global_over_local": [
+        0.5787989147728737,
+        0.35557368946498796
+      ],
+      "lambda_0": 0.04671863021189309,
+      "lambda_max": 0.04671863021189309,
+      "optimizer_update_executed": false,
+      "sha256": "b76386b71b62e7a464954909903b5f7f8fc31583265a93dccd78263775bbb169",
+      "warmup_applied": false
+    }
+  },
+  "chunks": {
+    "max_chunks": 6,
+    "no_mass": "zero",
+    "power": 2.0,
+    "whole_think_fallback": false
+  },
+  "code": {
+    "implementation_files": [
+      {
+        "path": "agent_system/multi_turn_rollout/rollout_loop.py",
+        "sha256": "277586a4c7779cf6af3bfdae61781dc6bcaca0af0b24604b2a798bf770a9cc48",
+        "size_bytes": 27056
+      },
+      {
+        "path": "agent_system/multi_turn_rollout/utils.py",
+        "sha256": "d634e4a65dba043e2240258b6c7e3d29ff60d6483e0d698b651d0d1e1a7495af",
+        "size_bytes": 7355
+      },
+      {
+        "path": "examples/urcr_online/run_urcr_v4_training.sh",
+        "sha256": "4300168ae1d5ef99cecd0188c4c65c6f0d65103b9f2db133a643762bc692a81f",
+        "size_bytes": 18332
+      },
+      {
+        "path": "scripts/pool_urcr_v4_calibration_population.py",
+        "sha256": "fcfe9de601d77000d02b84bc3c10ef13f45b7427927c53261edb02827662ea7f",
+        "size_bytes": 17999
+      },
+      {
+        "path": "scripts/resolve_urcr_v4_method.py",
+        "sha256": "f326b99ca573b2bb5ac113bc1c25879fdb8809c3a6cc488f2cb8acd388cb225b",
+        "size_bytes": 16387
+      },
+      {
+        "path": "scripts/run_urcr_v4_four_gpu_smoke.sh",
+        "sha256": "f983a99b2870075d8346bfeb0e28f7b392001732a893471e149b9024567db27e",
+        "size_bytes": 13722
+      },
+      {
+        "path": "verl/trainer/config/ppo_trainer.yaml",
+        "sha256": "3304164ce36517d69d5a9cc5fc21a4c8cd6018f255f6acf27feb1e2959a9eb82",
+        "size_bytes": 16274
+      },
+      {
+        "path": "verl/trainer/main_evisd.py",
+        "sha256": "8021e747d0263edec3cef270c3913a7a8db54195e24c4d552076f3ba56aff371",
+        "size_bytes": 7748
+      },
+      {
+        "path": "verl/trainer/ppo/evisd_ray_trainer.py",
+        "sha256": "05d5e94c73241dd4eb24ce3b84574e7cc35b8171c2e6650164e78fdbe0412113",
+        "size_bytes": 171382
+      },
+      {
+        "path": "verl/trainer/ppo/evisd_teacher.py",
+        "sha256": "403f1d10f9ff7810cf8f77e8fb2b2bdf148c42c5095e270ea850f62f38110add",
+        "size_bytes": 32474
+      },
+      {
+        "path": "verl/trainer/ppo/ray_trainer.py",
+        "sha256": "67655b35c1e1658d85c80e3f73fbfc5ca190f4f2e0e03487a6d45e1b4fcd5f93",
+        "size_bytes": 79552
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_calibration.py",
+        "sha256": "f6ff7cdd7a4cddb3f7e1ddb48f4bf68ed9a21d6741473880aa1153f98d502e49",
+        "size_bytes": 16292
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_controller.py",
+        "sha256": "2dc0a0b69d7acd8d3a79825ae5792602154f86d0d7c3162672e21ada1544361c",
+        "size_bytes": 14011
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_data.py",
+        "sha256": "a6a0d51ea2416235b31c7fc20d289e0cdb2264e3d972dd23189ba5141b3a01e6",
+        "size_bytes": 15854
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_local_objective.py",
+        "sha256": "cae1c75d1fdb88bceffc0c580310b011996a2daa74c8eb8f840004c59c1a5715",
+        "size_bytes": 4693
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_method.py",
+        "sha256": "19ab67d808ab78ceedc2909e4687892a3198670f52a278872354c928e47a87ac",
+        "size_bytes": 25148
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_pipeline.py",
+        "sha256": "1e6b94910c3cc53f6e930b927af5971a7161e323392ae026b0f3e5fa1ed3e267",
+        "size_bytes": 20153
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_requests.py",
+        "sha256": "42cc137c3fe820da726125575c1c4e2f10ed0fda6da85ebe5fc478679f002836",
+        "size_bytes": 12647
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_resolution.py",
+        "sha256": "120228aa5857482fc542f5e79b0d5405f4787d87af8295ba0f5c6d66f838a307",
+        "size_bytes": 10125
+      },
+      {
+        "path": "verl/trainer/ppo/urcr_v4_scorer.py",
+        "sha256": "f3b09aae782efab619844340093acc3c798636c87f48b5ac9b42fc58854ea138",
+        "size_bytes": 24517
+      },
+      {
+        "path": "verl/utils/checkpoint/fsdp_checkpoint_manager.py",
+        "sha256": "fd904bf1a6785c3f4c045e6100639ffb1061401fc0bf032f78dbbbefa548361f",
+        "size_bytes": 12468
+      },
+      {
+        "path": "verl/workers/actor/dp_actor.py",
+        "sha256": "d12622057eafb23eaf599bdd3db5c4f8b7d0d1eb4d148baed5d884d84dc17583",
+        "size_bytes": 57350
+      },
+      {
+        "path": "verl/workers/fsdp_workers.py",
+        "sha256": "39a2c1ffcdd62fd11c913de54db67dbf4849c9a75be5e3245f239ea3870a5dfb",
+        "size_bytes": 86119
+      }
+    ],
+    "implementation_manifest_sha256": "3481d5a704f45b6528c97c88db8f74f1c1af61284e9ce47a3962487871f61a4e",
+    "repo_root": "/data2/kongmu/agentic-RL/EviSD-URCR",
+    "workspace_git_head": "b4f1c0be3351166a0f76223f3b15ccae39ffdab9",
+    "workspace_git_status_sha256": "66b0faccd1c3c821eb4b03e8579a187d29b4c5950f3ef621d287bed065f1542b",
+    "workspace_tracked_diff_sha256": "bb10fc9def8a6792bb02e9964d47f0a43d36c341caa8b031fe0afe8f73afddaa"
+  },
+  "created_at": "2026-09-09T22:06:57+08:00",
+  "credit": {
+    "alpha_answer": 0.25,
+    "alpha_query": 1.0,
+    "lambda_think_answer": 1.0,
+    "lambda_think_query": 1.0,
+    "query_think_split": false,
+    "search_trajectory_absolute_cap": 2.0,
+    "terminal_broadcast_to_old_thinks": false
+  },
+  "data": {
+    "metadata_online_pipeline": false,
+    "sources": [
+      "hotpotqa",
+      "nq"
+    ],
+    "train_path": "/data0/kongmu/agentic-RL/data/searchR1_processed_direct/train.parquet",
+    "train_sha256": "aa98bf95dec9466899395e5d44e56e1b765cef7bc6b9ea226f5e6129bd0d360a"
+  },
+  "formal_protocol": {
+    "checkpoint_frequency": 25,
+    "evaluation_steps": [
+      150,
+      300
+    ],
+    "global_question_batch": 128,
+    "initialization": "original_base",
+    "ppo_epochs": 1,
+    "ppo_micro_batch_size_per_gpu": 16,
+    "ppo_mini_batch_size": 256,
+    "rollouts_per_question": 8,
+    "total_outer_steps": 300
+  },
+  "frozen": true,
+  "legacy": {
+    "agam": false,
+    "evisd_answer_pi": false,
+    "evisd_search_pi": false,
+    "evisd_teacher": false,
+    "fixed_support_reward": false,
+    "legacy_v1_residual": false,
+    "n1_reference": false,
+    "old_s_local": null,
+    "visible_focus_kl": false
+  },
+  "local_objective": {
+    "final_decay": false,
+    "lambda_max": 0.04671863021189309,
+    "minibatch_estimator": "preserve_outer_trajectory_mean",
+    "population_denominator": "original_trajectories",
+    "same_actor_forward_for_training": true,
+    "span_reduction": "mean_once",
+    "surrogate": "signed_tokenwise_ppo",
+    "warmup_outer_steps": 30
+  },
+  "metadata": {
+    "credit_enabled": false,
+    "diagnostics": "offline_sidecar_only",
+    "online_pipeline": false
+  },
+  "method_revision": "urcr_v4_unified_typed_r1_final",
+  "models": {
+    "diagnostic_s150": {
+      "hash_manifest": {
+        "path": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf/SHA256SUMS",
+        "sha256": "2278cb26670ded52a3c1995194f71657f24b4b10e7bfa0aea6c136790b2f45ee",
+        "size_bytes": 1917
+      },
+      "path": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf"
+    },
+    "formal_initialization": {
+      "hash_manifest": {
+        "path": "/data2/kongmu/agentic-RL/EviSD-URCR/logs/urcr_v4/base_shadow_gradient_calibration/model_sha256.txt",
+        "sha256": "73f63f75d8f4746c26f2faa555e841ddad4caba0c1f90678d78d173d5c7064a6",
+        "size_bytes": 579
+      },
+      "path": "/data0/kongmu/agentic-RL/models/Qwen2.5-3B-Instruct"
+    }
+  },
+  "probe": {
+    "alias_selection": "primary_then_stable_normalized_dedup_max_3",
+    "answer_content_ids_example": [
+      8687
+    ],
+    "answer_target_prefix": "<answer>\n",
+    "answer_target_prefix_ids_example": [
+      27,
+      9217,
+      397
+    ],
+    "artifact_path": "/data2/kongmu/agentic-RL/EviSD-URCR/artifacts/urcr_v4/probe_template.json",
+    "artifact_sha256": "60f9eadb75cbe5baaec6698b6ed95bf9c5fd6c918fb23966a5e30d42b8c4d514",
+    "assistant_close_and_user_open": "<|im_end|>\n<|im_start|>user\n",
+    "created_at": "2026-09-09T15:13:38+08:00",
+    "empty_observation_slot": "<documents></documents>",
+    "first_target_predictor": "target_position_minus_one",
+    "method_revision": "urcr_v4_unified_typed_r1_final",
+    "score_tokens": "answer_content_only",
+    "tokenizer_json_sha256": "9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa",
+    "tokenizer_path": "/data1/kongmu/model_checkpoints/base_grpo_3b_s150_hf",
+    "user_close_and_assistant_open": "<|im_end|>\n<|im_start|>assistant\n",
+    "version": "urcr_v4_native_neutral_answer_probe_r1"
+  },
+  "protocol_authority": {
+    "path": "/data2/kongmu/agentic-RL/research_design/urcr_evisd_staged_plans/plan_URCR-V4.md",
+    "sha256": "53a39e5ef3bf3c535cd5652f52f36c7467bea3277473198e30a852d1d811cafb",
+    "size_bytes": 65793
+  },
+  "responsibility": {
+    "answer": {
+      "delta": 0.1551302328705783,
+      "scale": 0.8357414349913601
+    },
+    "intervention": "position_preserving_outgoing_information_barrier",
+    "mapping": "positive_exponential",
+    "probe_template_version": "urcr_v4_native_neutral_answer_probe_r1",
+    "search": {
+      "delta": 0.08106568137804669,
+      "scale": 0.4315986054851895
+    },
+    "targets": "actual_sampled_action_content"
+  },
+  "retriever": {
+    "corpus_path": "/data2/kongmu/pretrain/wiki/wiki-18.jsonl",
+    "index_path": "/data2/kongmu/pretrain/wiki/e5_Flat.index",
+    "launcher": {
+      "path": "/data2/kongmu/agentic-RL/EviSD-URCR/examples/urcr_online/start_retriever.sh",
+      "sha256": "ab95aabab7116183fbf8de551e636ddc16da5c980e05b7833255d610f83042b8",
+      "size_bytes": 1078
+    },
+    "retriever_model": "/data2/kongmu/pretrain/e5-base-v2",
+    "topk": 3,
+    "url": "http://127.0.0.1:18268/retrieve"
+  },
+  "schema_version": 1,
+  "scorer": {
+    "backend": "fsdp_actor_sdpa_position_preserving_barrier",
+    "dtype": "bfloat16",
+    "max_total_tokens": 8192,
+    "micro_batch_size_per_gpu": 32,
+    "rollout_temperature": 1.0,
+    "token_budget_per_gpu": 262144
+  },
+  "search_utility": {
+    "combine": "same_sign_min_magnitude",
+    "control_count": 3,
+    "control_selection": "same_source_call_bucket_then_stable_fallback",
+    "delta": 0.5,
+    "group_whitening": false,
+    "negative_scale": 0.1,
+    "scale": 2.0,
+    "squash": "continuous_deadzone_tanh",
+    "unconsumable_observation_credit": 0.0,
+    "visible_exact_repeat_positive": false
+  }
+}
